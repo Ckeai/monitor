@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>记忆控制面板</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css?v=202" />
+</head>
+<body>
+  <!-- ========== LOGIN ========== -->
+  <div id="login-screen" class="login-screen hidden">
+    <div class="login-atmosphere" aria-hidden="true"></div>
+    <div class="login-panel">
+      <div class="login-brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5.4" y="5.4" width="13.2" height="13.2" rx="3" />
+            <path d="M9.2 2.4v3M14.8 2.4v3M9.2 18.6v3M14.8 18.6v3M2.4 9.2h3M2.4 14.8h3M18.6 9.2h3M18.6 14.8h3" />
+            <path d="M8.9 11 12 9.4l3.1 1.6L12 12.6z" />
+            <path d="M8.9 13.6l3.1 1.6 3.1-1.6" />
+          </svg>
+        </div>
+        <h1 class="brand-name">记忆控制面板</h1>
+        <p class="brand-tagline">Memory Control Panel</p>
+      </div>
+      <form id="login-form" class="login-form" autocomplete="off">
+        <label class="field">
+          <span>账号</span>
+          <input type="text" id="login-username" placeholder="super / admin / sarah" required />
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input type="password" id="login-password" placeholder="任意密码" required />
+        </label>
+        <label class="field">
+          <span>身份</span>
+          <div class="role-pills" role="radiogroup" aria-label="登录身份">
+            <label class="role-pill"><input type="radio" name="role" value="super" checked /><span>超管</span></label>
+            <label class="role-pill"><input type="radio" name="role" value="admin" /><span>管理员</span></label>
+            <label class="role-pill"><input type="radio" name="role" value="user" /><span>用户</span></label>
+          </div>
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">进入平台</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ========== APP SHELL ========== -->
+  <div id="app" class="app" data-sidebar="expanded">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="sidebar-brand">
+        <div class="brand-mark sm" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5.4" y="5.4" width="13.2" height="13.2" rx="3" />
+            <path d="M9.2 2.4v3M14.8 2.4v3M9.2 18.6v3M14.8 18.6v3M2.4 9.2h3M2.4 14.8h3M18.6 9.2h3M18.6 14.8h3" />
+            <path d="M8.9 11 12 9.4l3.1 1.6L12 12.6z" />
+            <path d="M8.9 13.6l3.1 1.6 3.1-1.6" />
+          </svg>
+        </div>
+        <span class="sidebar-brand-text">记忆控制面板</span>
+        <button type="button" class="sidebar-toggle" id="sidebar-toggle" title="展开/收起侧栏" aria-label="展开/收起侧栏">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h12M3 18h18"/></svg>
+        </button>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+    </aside>
+
+    <div class="main-column">
+      <header class="console-topbar" aria-label="顶栏">
+        <div class="console-topbar-left">
+          <button type="button" class="console-icon-btn" id="topbar-sidebar-toggle" title="展开/收起侧栏" aria-label="展开/收起侧栏">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+          </button>
+          <nav class="breadcrumb" id="breadcrumb" aria-label="面包屑"></nav>
+        </div>
+        <div class="console-topbar-right">
+          <button type="button" class="view-toggle-btn" id="topbar-view-switch" title="切换视图"></button>
+          <button type="button" class="console-icon-btn" id="topbar-bell" title="通知" aria-label="通知">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 9a6 6 0 0112 0c0 7 3 7 3 9H3c0-2 3-2 3-9"/><path d="M10 20a2 2 0 004 0"/></svg>
+          </button>
+          <button type="button" class="console-avatar" id="topbar-avatar" title="当前用户" aria-label="当前用户">SH</button>
+        </div>
+      </header>
+      <div class="page-head">
+        <div class="page-head-row">
+          <div class="page-head-left">
+            <div class="page-title-block">
+              <h1 id="page-title">Playground</h1>
+              <p class="page-subtitle" id="page-subtitle"></p>
+            </div>
+          </div>
+          <div class="page-head-right" id="page-head-right"></div>
+        </div>
+        <div class="page-toolbar" id="page-toolbar">
+          <div class="page-head-actions" id="page-head-actions"></div>
+        </div>
+      </div>
+
+      <main class="content" id="content"></main>
+    </div>
+  </div>
+
+  <aside id="detail-drawer" class="drawer hidden" aria-hidden="true">
+    <div class="drawer-header">
+      <h3 id="drawer-title">详情</h3>
+      <button type="button" class="icon-btn" id="drawer-close" aria-label="关闭">×</button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+  <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+  <div id="modal-host"></div>
+
+  <script src="js/data.js?v=71"></script>
+  <script src="js/graph.js?v=56"></script>
+  <script src="js/app.js?v=208"></script>
+</body>
+</html>
