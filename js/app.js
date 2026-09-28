@@ -717,35 +717,13 @@
         }
       );
     }
-    // 调试环境命名：默认环境 + 环境1/2/3（短名称），每个模式预置 4 个
-    ["extract", "generate"].forEach((key) => {
-      const list = state.pgSessions[key];
-      list.splice(4);
-      while (list.length < 4) {
-        list.push({
-          id: `session-${key}-e${list.length}`,
-          displayName: "",
-          startedAt: new Date().toISOString(),
-          messages: [{ role: "user", text: "开始一段新的对话…", at: new Date().toISOString() }],
-          memories: key === "extract" ? [] : null,
-        });
-      }
-      list.forEach((s, i) => {
-        s.displayName = i === 0 ? "默认环境" : `环境${i}`;
-      });
-    });
-    // 每个调试环境预置一份「调试环境记忆库」（右侧记忆列表 / 关系图谱的数据源）
-    ["extract", "generate"].forEach((key) => {
-      state.pgSessions[key].forEach((s, i) => {
-        if (!Array.isArray(s.library)) s.library = seedDebugLibrary(key, i);
-      });
-    });
-    state.pgSessionIdx = 0;
-    syncSharedDebugEnvs();
+    // 每个智能体对应一份调试会话（抽取 / 检索两侧按 spaceId 对齐）
+    syncDebugEnvsWithAgents();
+    state.pgSessionIdx = Math.min(state.pgSessionIdx, Math.max(0, (state.pgSessions.extract?.length || 1) - 1));
     return state.pgSessions;
   }
 
-  /** 调试环境记忆库种子：每个环境取不同切片，保证切换环境时库内容不同 */
+  /** 调试环境记忆库种子：每个智能体取不同切片，保证切换时库内容不同 */
   function seedDebugLibrary(modeKey, index) {
     if (modeKey !== "generate") return [];
     const ranges = [
@@ -767,11 +745,12 @@
     return state.debugMode === "generate" ? "generate" : "extract";
   }
 
-  /** 新建空白调试环境（抽取 / 检索两侧各一份，按序号对齐） */
-  function blankDebugEnv(modeKey, name) {
+  /** 新建空白智能体调试会话（抽取 / 检索两侧各一份） */
+  function blankDebugEnv(modeKey, name, spaceId) {
     const now = new Date().toISOString();
     return {
       id: `session-${modeKey}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      spaceId: spaceId || "",
       displayName: name || "",
       startedAt: now,
       messages: [{ role: "user", text: "开始一段新的对话…", at: now }],
@@ -782,36 +761,63 @@
   }
 
   /**
-   * 抽取调试与检索调试共用同一套环境清单：
-   * - 数量、名称按序号对齐
-   * - 选中下标共用 state.pgSessionIdx
-   * - 记忆库挂在 generate 侧（debugLibraryHost）
+   * 调试会话与智能体（记忆空间）一一对应：
+   * - 列表 = accessibleSpaces()
+   * - 两侧 extract/generate 按 spaceId 对齐，共享选中下标与记忆库（挂 generate）
    */
-  function syncSharedDebugEnvs() {
+  function syncDebugEnvsWithAgents() {
     const bag = state.pgSessions;
-    if (!bag?.extract || !bag?.generate) return bag;
-    const a = bag.extract;
-    const b = bag.generate;
-    const n = Math.max(a.length, b.length, 1);
-    while (a.length < n) {
-      a.push(blankDebugEnv("extract", b[a.length]?.displayName || (a.length === 0 ? "默认环境" : `环境${a.length}`)));
+    if (!bag) return bag;
+    if (!Array.isArray(bag.extract)) bag.extract = [];
+    if (!Array.isArray(bag.generate)) bag.generate = [];
+    const agents = accessibleSpaces();
+    const findBySpace = (list, spaceId) => list.find((s) => s.spaceId === spaceId);
+
+    const nextE = [];
+    const nextG = [];
+    agents.forEach((agent, i) => {
+      let e = findBySpace(bag.extract, agent.id);
+      let g = findBySpace(bag.generate, agent.id);
+      // 兼容旧数据：尚无 spaceId 时按序号认领
+      if (!e && bag.extract[i] && !bag.extract[i].spaceId) e = bag.extract[i];
+      if (!g && bag.generate[i] && !bag.generate[i].spaceId) g = bag.generate[i];
+      if (!e) e = blankDebugEnv("extract", agent.name, agent.id);
+      if (!g) g = blankDebugEnv("generate", agent.name, agent.id);
+      e.spaceId = agent.id;
+      g.spaceId = agent.id;
+      e.displayName = agent.name;
+      g.displayName = agent.name;
+      if (!Array.isArray(g.library) || !g.library.length) {
+        g.library = Array.isArray(e.library) && e.library.length ? e.library : seedDebugLibrary("generate", i);
+      }
+      nextE.push(e);
+      nextG.push(g);
+    });
+
+    if (!nextE.length) {
+      nextE.push(blankDebugEnv("extract", "默认智能体", ""));
+      nextG.push(blankDebugEnv("generate", "默认智能体", ""));
+      nextG[0].library = seedDebugLibrary("generate", 0);
     }
-    while (b.length < n) {
-      b.push(blankDebugEnv("generate", a[b.length]?.displayName || (b.length === 0 ? "默认环境" : `环境${b.length}`)));
-    }
-    for (let i = 0; i < n; i++) {
-      const name = a[i].displayName || b[i].displayName || (i === 0 ? "默认环境" : `环境${i}`);
-      a[i].displayName = name;
-      b[i].displayName = name;
-      if (!Array.isArray(b[i].library)) b[i].library = Array.isArray(a[i].library) ? a[i].library : [];
-    }
-    if (state.pgSessionIdx >= n) state.pgSessionIdx = Math.max(0, n - 1);
+
+    bag.extract = nextE;
+    bag.generate = nextG;
+
+    let idx = nextG.findIndex((s) => s.spaceId && s.spaceId === state.spaceId);
+    if (idx < 0) idx = Math.min(Math.max(0, state.pgSessionIdx), nextG.length - 1);
+    state.pgSessionIdx = idx;
+    if (nextG[idx]?.spaceId) state.spaceId = nextG[idx].spaceId;
     return bag;
+  }
+
+  /** @deprecated 兼容旧调用名：统一走智能体对齐 */
+  function syncSharedDebugEnvs() {
+    return syncDebugEnvsWithAgents();
   }
 
   function debugEnvList() {
     ensurePgSessions();
-    syncSharedDebugEnvs();
+    syncDebugEnvsWithAgents();
     return state.pgSessions[currentModeKey()] || [];
   }
 
@@ -1095,8 +1101,12 @@
     return session?.id || session?.name || `session-${index + 1}`;
   }
 
-  /** 默认名称：会话 id + 首条内容；重命名后用 displayName */
+  /** 默认名称：优先智能体名（spaceId / displayName） */
   function sessionListName(session, index) {
+    if (session?.spaceId) {
+      const agent = spaceById(session.spaceId);
+      if (agent?.name?.trim()) return agent.name.trim();
+    }
     if (session?.displayName?.trim()) return session.displayName.trim();
     const id = sessionName(session, index);
     const first = sessionFirstContent(session);
@@ -1867,6 +1877,7 @@
       return;
     }
     state.spaceId = space.id;
+    ensurePgSessions();
 
     const buildContextBar = () => {
       return `
@@ -1881,14 +1892,10 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33h.01a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51h.01a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.01a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
             参数配置
           </button>
-          ${
-            state.configTab === "retrieve"
-              ? ""
-              : `<button type="button" class="btn btn-primary btn-sm cfg-env-new" id="pg-env-new" title="新建调试环境">
+          <button type="button" class="btn btn-primary btn-sm cfg-env-new" id="pg-env-new" title="新建智能体">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-            新建调试环境
-          </button>`
-          }
+            新建智能体
+          </button>
         </div>
       </div>`;
     };
@@ -1921,13 +1928,13 @@
     };
 
     const bindBar = () => {
-      $("#pg-env-new")?.addEventListener("click", () => openCreateEnvModal());
+      $("#pg-env-new")?.addEventListener("click", () => openAgentFormModal(null));
       bindEnvPicker();
-      // Tab 行右侧：调试环境切换 + 参数配置弹窗
+      // Tab 行右侧：智能体切换 + 参数配置弹窗
       $("#pg-cfg-open")?.addEventListener("click", () => openDebugCfgModal(space));
       $("#cfg-space-select")?.addEventListener("change", (e) => {
         state.spaceId = e.target.value;
-        state.pgSessionIdx = 0;
+        syncDebugEnvsWithAgents();
         state.engineVersionId = "preset-current";
         destroyGraph();
         renderSpaceConfig(root);
@@ -1939,8 +1946,7 @@
           if (isEngineTab(state.configTab)) saveActiveEngine(body, space);
           const next = t.dataset.ctab;
           if (isPlaygroundTab(state.configTab) && isPlaygroundTab(next) && state.configTab !== next) {
-            // 保留当前调试环境（两种调试模式的环境按序号对齐，且共享同一个记忆库），
-            // 只重置本轮的检索轮次与高亮
+            // 保留当前智能体（抽取/检索共用同一调试记忆库），只重置本轮检索轮次与高亮
             state.recallTurns = null;
             state.recallGraphHighlight = null;
             state.outView = "output";
@@ -2704,9 +2710,9 @@
                 <button type="button" data-out="graph" class="${outView === "graph" ? "active" : ""}">图谱</button>
               </div>
               <div class="pg-out-actions">
-                <button type="button" class="btn btn-secondary btn-sm pg-insert-lib-btn" id="pg-insert-lib" title="将本轮抽取结果整批插入当前调试环境的记忆库，供记忆检索调试召回">
+                <button type="button" class="btn btn-secondary btn-sm pg-insert-lib-btn" id="pg-insert-lib" title="将本轮抽取结果整批插入当前智能体的调试记忆库，供记忆检索调试召回">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-                  插入调试记忆库
+                  插入智能体库
                 </button>
                 <button type="button" class="pg-out-clear-btn ${outView === "graph" ? "" : "hidden"}" id="pg-graph-fs-btn" title="全屏查看图谱">
                   <span class="pg-fs-ico" aria-hidden="true">⛶</span> 全屏
@@ -2796,7 +2802,7 @@
                 <section class="rv-card">
                   <div class="rv-card-hd">
                     <h3>检索验证</h3>
-                    <span class="um-card-sub">调试环境：${esc(envName)}</span>
+                    <span class="um-card-sub">智能体：${esc(envName)}</span>
                   </div>
                   <div class="rv-query-bar">
                     <input type="text" class="input rv-query-input" id="rv-query" value="${esc(query)}"
@@ -2833,7 +2839,7 @@
               <div class="pg-col pg-col-lib">
                 <div class="um-card um-tabbed-card dl-card">
                   <div class="um-card-hd">
-                    <div class="um-tabs um-card-tabs" role="tablist" aria-label="调试环境记忆库视图">
+                    <div class="um-tabs um-card-tabs" role="tablist" aria-label="智能体调试记忆库视图">
                       <button type="button" class="um-tab ${libTab === "list" ? "active" : ""}" data-dl-tab="list" role="tab" aria-selected="${libTab === "list"}">记忆列表</button>
                       <button type="button" class="um-tab ${libTab === "graph" ? "active" : ""}" data-dl-tab="graph" role="tab" aria-selected="${libTab === "graph"}">记忆关系图谱</button>
                     </div>
@@ -2884,7 +2890,7 @@
         <div class="pg-graph-fs hidden" id="pg-graph-fs" aria-hidden="true">
           <div class="pg-graph-fs-hd">
             <button type="button" class="pg-graph-fs-back" id="pg-graph-fs-back">← 返回</button>
-            <div class="pg-graph-fs-session" id="pg-graph-fs-session">当前调试环境</div>
+            <div class="pg-graph-fs-session" id="pg-graph-fs-session">当前智能体</div>
             <button type="button" class="pg-out-clear-btn" id="pg-graph-fs-exit">
               <span class="pg-fs-ico" aria-hidden="true">⛶</span> 退出全屏
             </button>
@@ -3148,8 +3154,8 @@
             </span>
             <button type="button" class="mem-lib-insert ${inLib ? "is-in-lib" : ""}"
               data-mem-insert="${esc(m.content)}" data-mem-type="${esc(type)}"
-              title="${inLib ? "该记忆已在当前调试环境库中" : "将该条抽取记忆插入当前调试环境的记忆库，供记忆检索调试使用"}">
-              ${inLib ? "已在调试环境库" : "插入至调试环境库"}
+              title="${inLib ? "该记忆已在当前智能体调试库中" : "将该条抽取记忆插入当前智能体的调试记忆库，供记忆检索调试使用"}">
+              ${inLib ? "已在智能体库" : "插入至智能体库"}
             </button>
           </div>
           <p class="mem-text">${esc(m.content)}</p>
@@ -3168,7 +3174,7 @@
         content: m.content,
         type: m.type,
         extractAt: m.createdAt,
-        sessionLabel: "调试环境库",
+        sessionLabel: "智能体库",
         roundLabel: memoryRoundLabel(msgs, m),
         sourceItem: memorySourceItem(msgs, m),
       }));
@@ -3656,7 +3662,7 @@
       return false;
     }
     if (lib.some((m) => String(m.content || "").trim() === content)) {
-      if (!silent) toast("该记忆已在当前调试环境库中");
+      if (!silent) toast("该记忆已在当前智能体库中");
       return false;
     }
     const now = new Date().toISOString();
@@ -3673,7 +3679,7 @@
     state.pgLibPage = 1;
     if (state.debugMode === "generate") renderDebugLibrary();
     refreshDebugLogModule();
-    if (!silent) toast(`已插入至调试环境库「${debugLibraryEnvName()}」`);
+    if (!silent) toast(`已插入至智能体库「${debugLibraryEnvName()}」`);
     return true;
   }
 
@@ -3696,12 +3702,12 @@
       else dup += 1;
     });
     if (!added) {
-      toast(`抽取结果均已存在于调试环境库「${debugLibraryEnvName()}」`);
+      toast(`抽取结果均已存在于智能体库「${debugLibraryEnvName()}」`);
       return;
     }
     renderOutputPanel(space || spaceById(state.spaceId));
     toast(
-      `已插入 ${added} 条至调试环境库「${debugLibraryEnvName()}」${dup ? `，${dup} 条已存在` : ""}`
+      `已插入 ${added} 条至智能体库「${debugLibraryEnvName()}」${dup ? `，${dup} 条已存在` : ""}`
     );
   }
 
@@ -3755,8 +3761,8 @@
         );
         if (!ok) return;
         btn.classList.add("is-in-lib");
-        btn.textContent = "已在调试环境库";
-        btn.title = "该记忆已在当前调试环境库中";
+        btn.textContent = "已在智能体库";
+        btn.title = "该记忆已在当前智能体库中";
       });
     });
     $$(".mem-result", scope).forEach((card, i) => {
@@ -3806,7 +3812,7 @@
     const filtered = rows.length !== all.length;
     const spaceName = spaceById(state.spaceId)?.name || "";
     panel.innerHTML = `
-      <div class="um-filters" role="group" aria-label="调试环境记忆库筛选">
+      <div class="um-filters" role="group" aria-label="智能体调试记忆库筛选">
         <label class="um-filter-item">
           <span>记忆类型</span>
           <select id="dl-f-type" class="um-filter-select">
@@ -3852,7 +3858,7 @@
                         <td class="um-mem-time">${esc(fmtMemTime(r.updatedAt))}</td>
                         <td class="um-td-action">
                           <button type="button" class="mon-link-btn" data-dl-detail="${esc(r.id)}">详情</button>
-                          <button type="button" class="um-icon-btn um-danger" data-dl-del="${esc(r.id)}" title="从调试环境库移除" aria-label="移除">🗑</button>
+                          <button type="button" class="um-icon-btn um-danger" data-dl-del="${esc(r.id)}" title="从智能体库移除" aria-label="移除">🗑</button>
                         </td>
                       </tr>`
                     )
@@ -3864,7 +3870,7 @@
           : `<div class="um-filter-empty">${
               all.length
                 ? "当前筛选条件下暂无记忆"
-                : "当前调试环境记忆库为空，可在左侧检索结果中点击「插入至调试环境库」添加"
+                : "当前智能体调试记忆库为空，可在左侧检索结果中点击「插入至智能体库」添加"
             }</div>`
       }`;
     bindDebugLibrary(panel);
@@ -3932,7 +3938,7 @@
         lib.splice(i, 1);
         renderDebugLibrary();
         refreshDebugLogModule();
-        toast("已从当前调试环境记忆库移除");
+        toast("已从当前智能体调试记忆库移除");
       });
     });
   }
@@ -4789,13 +4795,13 @@
       .join("");
     return `
       <div class="pg-env-pick cfg-env-pick" id="pg-env-picker">
-        <span>调试环境</span>
+        <span>智能体</span>
         <div class="pg-env-dd">
-          <button type="button" class="pg-env-dd-trigger" id="pg-env-trigger" aria-haspopup="listbox" aria-expanded="false" title="选择并激活调试环境">
+          <button type="button" class="pg-env-dd-trigger" id="pg-env-trigger" aria-haspopup="listbox" aria-expanded="false" title="选择智能体（每个智能体对应一份调试环境）">
             <span class="pg-env-dd-label" id="pg-env-label">${esc(curName)}</span>
             <svg class="pg-env-dd-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
           </button>
-          <div class="pg-env-dd-panel hidden" id="pg-env-panel" role="listbox" aria-label="调试环境列表">
+          <div class="pg-env-dd-panel hidden" id="pg-env-panel" role="listbox" aria-label="智能体列表">
             ${items}
           </div>
           <div class="pg-env-dd-menu hidden" id="pg-env-menu" role="menu">
@@ -4820,11 +4826,13 @@
   function activateDebugEnv(idx) {
     const list = debugEnvList();
     const next = Math.min(Math.max(0, Number(idx) || 0), Math.max(0, list.length - 1));
-    if (next === state.pgSessionIdx) {
+    const sess = list[next];
+    if (next === state.pgSessionIdx && (!sess?.spaceId || sess.spaceId === state.spaceId)) {
       closeEnvPicker();
       return;
     }
     state.pgSessionIdx = next;
+    if (sess?.spaceId) state.spaceId = sess.spaceId;
     state.outCurrentOpen = true;
     state.recallTurns = null;
     state.recallGraphHighlight = null;
@@ -4932,10 +4940,11 @@
 
   function openRenameEnvModal(idx) {
     ensurePgSessions();
-    syncSharedDebugEnvs();
+    syncDebugEnvsWithAgents();
     const bag = state.pgSessions;
     const sess = bag[currentModeKey()][idx];
     if (!sess) return;
+    const space = sess.spaceId ? spaceById(sess.spaceId) : null;
     const host = $("#modal-host");
     if (!host) return;
     const curName = sessionListName(sess, idx);
@@ -4943,11 +4952,11 @@
       <div class="modal-backdrop" id="env-rename-modal">
         <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="env-rename-title">
           <div class="modal-hd">
-            <h3 id="env-rename-title">重命名调试环境</h3>
+            <h3 id="env-rename-title">重命名智能体</h3>
             <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
           </div>
           <div class="modal-bd">
-            <label class="field"><span>环境名</span>
+            <label class="field"><span>智能体名称</span>
               <input type="text" id="env-rename-input" class="input" maxlength="30" autocomplete="off" value="${esc(curName)}" />
             </label>
           </div>
@@ -4977,12 +4986,16 @@
         input?.focus();
         return;
       }
+      if (space) {
+        space.name = title;
+        space.updatedAt = new Date().toISOString();
+      }
       if (bag.extract[idx]) bag.extract[idx].displayName = title;
       if (bag.generate[idx]) bag.generate[idx].displayName = title;
       close();
       refreshSessionSelect();
       refreshEnvPicker();
-      toast("已重命名");
+      toast("已重命名智能体");
     };
     $("#modal-confirm", host).onclick = submit;
     input?.addEventListener("keydown", (e) => {
@@ -4990,66 +5003,14 @@
     });
   }
 
-  // 新建调试环境：弹框填写环境名，创建后自动激活（环境即当前调试模式下的会话容器）
+  // 新建智能体：复用记忆空间新建表单；创建后自动对齐调试环境并激活
   function openCreateEnvModal() {
-    const host = $("#modal-host");
-    if (!host) return;
-    host.innerHTML = `
-      <div class="modal-backdrop" id="env-create-modal">
-        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="env-create-title">
-          <div class="modal-hd">
-            <h3 id="env-create-title">新建调试环境</h3>
-            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
-          </div>
-          <div class="modal-bd">
-            <label class="field"><span>环境名</span>
-              <input type="text" id="env-name-input" class="input" placeholder="例如：巡演购票场景" maxlength="30" autocomplete="off" />
-            </label>
-          </div>
-          <div class="modal-ft">
-            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
-            <button type="button" class="btn btn-primary" id="modal-confirm">创建</button>
-          </div>
-        </div>
-      </div>`;
-    const close = () => {
-      host.innerHTML = "";
-    };
-    $("#modal-x", host).onclick = close;
-    $("#modal-cancel", host).onclick = close;
-    $("#env-create-modal", host).addEventListener("click", (e) => {
-      if (e.target.id === "env-create-modal") close();
-    });
-    const input = $("#env-name-input", host);
-    setTimeout(() => input?.focus(), 0);
-    const submit = () => {
-      const name = (input?.value || "").trim();
-      if (!name) {
-        toast("请输入环境名");
-        input?.focus();
-        return;
-      }
-      close();
-      createEnvWithName(name);
-    };
-    $("#modal-confirm", host).onclick = submit;
-    input?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") submit();
-    });
+    openAgentFormModal(null);
   }
 
   function createEnvWithName(name) {
-    ensurePgSessions();
-    const bag = state.pgSessions;
-    // 两侧同步新建，保证切换到记忆检索调试时也有该环境且默认选中
-    bag.extract.unshift(blankDebugEnv("extract", name));
-    bag.generate.unshift(blankDebugEnv("generate", name));
-    syncSharedDebugEnvs();
-    selectSession(0);
-    toast(`已新建调试环境「${name}」并激活`);
-    // 新建环境后自动弹出参数配置（两侧共用 space.config）
-    const space = spaceById(state.spaceId);
-    if (space) openDebugCfgModal(space);
+    // 兼容旧调用：改为走智能体新建
+    openAgentFormModal(null);
   }
 
   // 参数配置弹窗：内容与「记忆参数配置」一致（四引擎表单），但不带智能体选择；底部提供取消/保存按钮，取消回滚到打开时的快照
@@ -5240,6 +5201,8 @@
 
   function selectSession(idx) {
     state.pgSessionIdx = idx;
+    const sess = debugEnvList()[idx];
+    if (sess?.spaceId) state.spaceId = sess.spaceId;
     state.outCurrentOpen = true;
     closeSessionMenu();
     refreshSessionSelect();
@@ -5255,67 +5218,31 @@
   }
 
   function createSession() {
-    ensurePgSessions();
-    const bag = state.pgSessions;
-    bag.extract.unshift(blankDebugEnv("extract", ""));
-    bag.generate.unshift(blankDebugEnv("generate", ""));
-    syncSharedDebugEnvs();
-    selectSession(0);
-    toast("已新建会话");
+    openAgentFormModal(null);
   }
 
   function renameSession(idx) {
-    ensurePgSessions();
-    syncSharedDebugEnvs();
-    const bag = state.pgSessions;
-    const sess = bag[currentModeKey()][idx];
-    if (!sess) return;
-    const next = window.prompt("重命名会话", sessionListName(sess, idx));
-    if (next == null) return;
-    const title = next.trim();
-    if (!title) {
-      toast("名称不能为空");
-      return;
-    }
-    if (bag.extract[idx]) bag.extract[idx].displayName = title;
-    if (bag.generate[idx]) bag.generate[idx].displayName = title;
-    refreshSessionSelect();
-    refreshChatSessionHeader();
-    toast("已重命名");
+    openRenameEnvModal(idx);
   }
 
   function duplicateSession(idx) {
-    ensurePgSessions();
-    syncSharedDebugEnvs();
-    const bag = state.pgSessions;
-    const srcE = bag.extract[idx];
-    const srcG = bag.generate[idx];
-    if (!srcE && !srcG) return;
-    const label = sessionListName(srcE || srcG, idx);
-    const copyE = JSON.parse(JSON.stringify(srcE || blankDebugEnv("extract", label)));
-    const copyG = JSON.parse(JSON.stringify(srcG || blankDebugEnv("generate", label)));
-    copyE.id = `session-extract-${Date.now().toString(36)}`;
-    copyG.id = `session-generate-${Date.now().toString(36)}`;
-    copyE.displayName = `${label}（副本）`;
-    copyG.displayName = `${label}（副本）`;
-    copyE.startedAt = new Date().toISOString();
-    copyG.startedAt = copyE.startedAt;
-    bag.extract.splice(idx + 1, 0, copyE);
-    bag.generate.splice(idx + 1, 0, copyG);
-    selectSession(idx + 1);
-    toast("已复制会话");
+    toast("智能体与调试环境一一对应，请通过「新建智能体」创建");
   }
 
   function deleteSession(idx) {
     ensurePgSessions();
-    syncSharedDebugEnvs();
+    syncDebugEnvsWithAgents();
     const sessions = state.pgSessions[currentModeKey()];
     if (sessions.length <= 1) {
-      toast("至少保留一个调试环境");
+      toast("至少保留一个智能体");
       return;
     }
     const sess = sessions[idx];
     if (!sess) return;
+    if (sess.spaceId) {
+      confirmDeleteAgentSpace(sess.spaceId);
+      return;
+    }
     confirmDeleteSession(idx, sessionListLabel(sess, idx));
   }
 
@@ -5326,11 +5253,11 @@
       <div class="modal-backdrop" id="delete-session-modal">
         <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="delete-session-title">
           <div class="modal-hd">
-            <h3 id="delete-session-title">删除调试环境？</h3>
+            <h3 id="delete-session-title">删除智能体？</h3>
             <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
           </div>
           <div class="modal-bd">
-            <p class="modal-desc">确定删除「${esc(label)}」？删除后不可恢复。</p>
+            <p class="modal-desc">确定删除「${esc(label)}」？将同时移除其对应的调试环境，删除后不可恢复。</p>
           </div>
           <div class="modal-ft">
             <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
@@ -5343,26 +5270,31 @@
     };
     const doDelete = () => {
       ensurePgSessions();
-      syncSharedDebugEnvs();
+      syncDebugEnvsWithAgents();
       const bag = state.pgSessions;
       if (bag.extract.length <= 1 || bag.generate.length <= 1) {
-        toast("至少保留一个调试环境");
+        toast("至少保留一个智能体");
         close();
         return;
       }
-      if (!bag.extract[idx] && !bag.generate[idx]) {
+      const sess = bag.extract[idx] || bag.generate[idx];
+      if (!sess) {
         close();
         return;
+      }
+      if (sess.spaceId) {
+        const i = MEMORA_DATA.spaces.findIndex((s) => s.id === sess.spaceId);
+        if (i >= 0) MEMORA_DATA.spaces.splice(i, 1);
+        if (state.spaceId === sess.spaceId) state.spaceId = null;
       }
       bag.extract.splice(idx, 1);
       bag.generate.splice(idx, 1);
-      syncSharedDebugEnvs();
-      if (state.pgSessionIdx >= bag.extract.length) state.pgSessionIdx = bag.extract.length - 1;
-      else if (state.pgSessionIdx > idx) state.pgSessionIdx -= 1;
+      syncDebugEnvsWithAgents();
       selectSession(state.pgSessionIdx);
       refreshEnvPicker();
       close();
-      toast("已删除调试环境");
+      toast("已删除智能体");
+      renderPage();
     };
     $("#modal-x", host).onclick = close;
     $("#modal-cancel", host).onclick = close;
@@ -8792,9 +8724,16 @@
           },
         });
         toast("已新增记忆库");
+        state.spaceId = newSpace.id;
+        ensurePgSessions();
+        syncDebugEnvsWithAgents();
       }
       close();
       renderPage();
+      if (!isEdit && state.page === "config") {
+        const sp = spaceById(state.spaceId);
+        if (sp) openDebugCfgModal(sp);
+      }
     };
   }
 
@@ -8852,6 +8791,7 @@
       });
       if (state.spaceId === spaceId) state.spaceId = accessibleSpaces()[0]?.id || null;
       if (state.bankAgentId === spaceId) state.bankAgentId = null;
+      if (state.pgSessions) syncDebugEnvsWithAgents();
       toast("已删除记忆库");
       close();
       renderPage();
