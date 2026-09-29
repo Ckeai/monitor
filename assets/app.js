@@ -1019,7 +1019,7 @@
   function enterAs(user, { silent = false } = {}) {
     state.user = { ...user };
     state.viewMode = user.role === "user" ? "user" : "admin";
-    state.page = user.role === "user" ? "memories" : "monitor";
+    state.page = "memories";
     const spaces = accessibleSpaces();
     state.spaceId = spaces[0]?.id || null;
     state.selectedUserId = user.role === "user" ? user.id : "u-sarah";
@@ -1133,7 +1133,7 @@
         backBtn.setAttribute("aria-label", "返回管理端");
         backBtn.addEventListener("click", () => {
           state.viewMode = "admin";
-          state.page = "monitor";
+          state.page = "memories";
           renderChrome();
           renderPage();
         });
@@ -8491,7 +8491,7 @@
       if (!btn || state.user.role === "user") return;
       const target = btn.dataset.targetView || (state.viewMode === "admin" ? "user" : "admin");
       state.viewMode = target;
-      state.page = state.viewMode === "user" ? "memories" : "monitor";
+      state.page = "memories";
       renderChrome();
       renderPage();
     });

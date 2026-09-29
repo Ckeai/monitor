@@ -116,6 +116,7 @@
     extractPromptMod: "rules", // rules | context
     engineDraftBySpace: {},
     engineBaselineBySpace: null,
+    pgExtractInserted: null, // content -> true：本轮抽取结果已点「插入记忆库」
     umCardView: null, // 兼容旧逻辑（已不再用于详情浮层）
     umTab: "list", // list | graph —— 记忆详情默认进列表
     umMemEdits: {}, // id -> 编辑覆盖（演示记忆持久化用）
@@ -177,6 +178,23 @@
 
 你必须基于输入内容进行判断，不得编造、推测或扩展用户未明确表达的信息。`;
 
+  const DEFAULT_RULES_USER = `1. 通用交互偏好：用户偏好的回答风格、展示形式、详略程度、回复语言、结构、语气等。
+2. 研发技术相关：技术偏好，包括编程语言、数据库、中间件、框架、技术栈、开发工具、操作系统，以及性能或安全相关偏好。
+3. 银行业务及工作经验相关：职责范围、岗位职能、过往经历、业务知识，以及长期关注的产品或客户等。
+4. 日常办公相关：办公任务偏好，如邮件风格、周报/月报总结、会议纪要、PPT/文档/表格偏好，以及常用工具等。
+5. 工作目标/阶段性任务：当前目标、待办事项与工作计划。注意：仅从用户消息中提取，勿与助手内容混写。`;
+
+  const DEFAULT_RULES_ASSISTANT = `1. 助手制定的计划/日程表。
+2. 助手指定的方案/推荐的产品：仅当用户明确认可时提取（如「没问题」「我采用这个」等）；认可意图弱或不明确时不提取。`;
+
+  const DEFAULT_RULES_EXCLUDE = `1. 纯业务咨询问题：知识库/RAG 中已包含的信息。
+2. 单次操作：一次性翻译、计算、查时间或查定义等。
+3. 未认可内容：用户未确认的助手方案、产品或数据。
+4. 临时任务细节：写某封邮件、润色某篇文章、某次具体计算等一次性任务细节。
+5. 一次性代码与配置：临时代码片段、SQL、Shell 命令或配置参数。
+6. 报错与修复：某次具体报错信息及对应修复命令。`;
+
+  /** @deprecated 兼容旧数据：单段提取规则 */
   const DEFAULT_EXTRACT_RULES = `请按照以下规则提取用户记忆：
 
 1. 仅提取具有长期价值或未来可能被重复使用的信息。
@@ -195,6 +213,164 @@
 - type：记忆类型
 - confidence：对该记忆准确性的置信度`;
 
+  function composeExtractRulesText(pm) {
+    const user = (pm?.rulesUser || "").trim();
+    const assistant = (pm?.rulesAssistant || "").trim();
+    const exclude = (pm?.rulesExclude || "").trim();
+    if (user || assistant || exclude) {
+      const parts = [];
+      if (user) parts.push("## 可从用户消息中提取的内容", "", user, "");
+      if (assistant) parts.push("## 可从助手消息中提取的内容", "", assistant, "");
+      if (exclude) parts.push("## 禁止提取的内容", "", exclude, "");
+      return parts.join("\n").trim();
+    }
+    return String(pm?.extractRules || "").trim();
+  }
+
+  function defaultFewShotExamples() {
+    return [
+      {
+        id: "fs-pref-style",
+        name: "用户偏好提取示例",
+        includeInPrompt: true,
+        messages: [
+          { role: "user", content: "我喜欢简洁一点的回答，不需要太多背景介绍。", included: true },
+          { role: "assistant", content: "好的，之后我会尽量用更简洁的方式回答。", included: true },
+        ],
+        memories: [
+          {
+            content: "用户偏好简洁的回答方式。",
+            rationale: "用户明确表达了对回答长度和信息密度的长期偏好，属于相对稳定的用户交互偏好。",
+          },
+        ],
+      },
+      {
+        id: "fs-tech-bg",
+        name: "技术背景提取示例",
+        includeInPrompt: true,
+        messages: [
+          { role: "user", content: "我们线上主要用 Java + Spring Boot，数据库是 MySQL。", included: true },
+          { role: "assistant", content: "了解，后续讨论会按这套技术栈来对齐。", included: true },
+        ],
+        memories: [
+          {
+            content: "用户团队技术栈为 Java、Spring Boot、MySQL。",
+            rationale: "用户明确说明了稳定使用的技术组件，属于可复用的研发技术背景。",
+          },
+        ],
+      },
+      {
+        id: "fs-no-memory",
+        name: "无记忆场景示例",
+        includeInPrompt: true,
+        messages: [
+          { role: "user", content: "帮我算一下 123 × 456。", included: true },
+          { role: "assistant", content: "123 × 456 = 56088。", included: true },
+        ],
+        memories: [],
+      },
+    ];
+  }
+
+  function ensureFewShotExamples(extract) {
+    if (!extract) return [];
+    const SEED_VER = 3;
+    if (!Array.isArray(extract.fewShotExamples)) {
+      extract.fewShotExamples = defaultFewShotExamples();
+      extract.fewShotSeedVersion = SEED_VER;
+    } else if (extract.fewShotSeedVersion !== SEED_VER) {
+      // 内置示例升级为 USER/ASSISTANT 成对；自定义示例保留
+      const seedMap = Object.fromEntries(defaultFewShotExamples().map((s) => [s.id, s]));
+      extract.fewShotExamples = extract.fewShotExamples.map((ex) =>
+        seedMap[ex.id] ? JSON.parse(JSON.stringify(seedMap[ex.id])) : ex
+      );
+      extract.fewShotSeedVersion = SEED_VER;
+    }
+    extract.fewShotExamples.forEach((ex, i) => {
+      if (!ex.id) ex.id = `fs-${Date.now()}-${i}`;
+      if (!ex.name) ex.name = `示例 ${i + 1}`;
+      if (!Array.isArray(ex.messages)) ex.messages = [];
+      if (!Array.isArray(ex.memories)) ex.memories = [];
+      if (ex.includeInPrompt == null) ex.includeInPrompt = true;
+      ex.messages.forEach((m) => {
+        if (!m.role) m.role = "user";
+        if (m.content == null) m.content = "";
+        if (m.included == null) m.included = true;
+      });
+      ex.memories.forEach((m) => {
+        if (m.content == null) m.content = "";
+        if (m.rationale == null) m.rationale = "";
+      });
+    });
+    return extract.fewShotExamples;
+  }
+
+  function fewShotTurnCount(ex) {
+    const n = Array.isArray(ex?.messages) ? ex.messages.length : 0;
+    return Math.ceil(n / 2);
+  }
+
+  function ensureFewShotMessagePairs(messages) {
+    const list = Array.isArray(messages) ? messages.map((m) => ({ ...m })) : [];
+    if (!list.length) {
+      return [
+        { role: "user", content: "", included: true },
+        { role: "assistant", content: "", included: true },
+      ];
+    }
+    const lastRole = String(list[list.length - 1]?.role || "user").toLowerCase();
+    if (lastRole !== "assistant") {
+      list.push({ role: "assistant", content: "", included: true });
+    }
+    return list;
+  }
+
+  function fewShotMemoryCount(ex) {
+    return Array.isArray(ex?.memories) ? ex.memories.length : 0;
+  }
+
+  function fewShotPreviewText(ex) {
+    const mem = (ex?.memories || []).find((m) => String(m.content || "").trim());
+    if (mem) return String(mem.content).trim();
+    const msg = (ex?.messages || []).find((m) => String(m.content || "").trim());
+    return msg ? String(msg.content).trim() : "";
+  }
+
+  function composeFewShotPromptText(examples) {
+    const list = Array.isArray(examples) ? examples : [];
+    if (!list.length) return "";
+    const parts = ["# 提取示例", ""];
+    list.forEach((ex, i) => {
+      const name = String(ex?.name || `示例 ${i + 1}`).trim() || `示例 ${i + 1}`;
+      parts.push(`## 示例 ${i + 1}：${name}`, "");
+      parts.push("### 对话", "");
+      const msgs = (Array.isArray(ex?.messages) ? ex.messages : []).filter(
+        (m) => m?.included !== false && String(m?.content || "").trim()
+      );
+      if (!msgs.length) {
+        parts.push("（无对话内容）", "");
+      } else {
+        msgs.forEach((m) => {
+          const role = String(m?.role || "user").toLowerCase() === "assistant" ? "ASSISTANT" : "USER";
+          parts.push(`${role}：${String(m?.content || "").trim()}`, "");
+        });
+      }
+      parts.push("### 期望提取的记忆", "");
+      const mems = Array.isArray(ex?.memories) ? ex.memories : [];
+      const validMems = mems.filter((m) => String(m?.content || "").trim() || String(m?.rationale || "").trim());
+      if (!validMems.length) {
+        parts.push("暂无需要提取的记忆。", "");
+      } else {
+        validMems.forEach((m, mi) => {
+          parts.push(`${mi + 1}. 记忆内容：${String(m.content || "").trim()}`);
+          parts.push(`   提取依据：${String(m.rationale || "").trim() || "—"}`);
+          parts.push("");
+        });
+      }
+    });
+    return parts.join("\n").trim();
+  }
+
   function defaultExtractPromptModules() {
     return {
       roleTask: DEFAULT_EXTRACT_ROLE,
@@ -208,6 +384,9 @@
         historyConvRange: "10",
         historyConvCustom: 10,
       },
+      rulesUser: DEFAULT_RULES_USER,
+      rulesAssistant: DEFAULT_RULES_ASSISTANT,
+      rulesExclude: DEFAULT_RULES_EXCLUDE,
       extractRules: DEFAULT_EXTRACT_RULES,
       outputBehavior: DEFAULT_EXTRACT_OUTPUT,
       outputFields: ["memory", "type", "confidence"],
@@ -229,11 +408,15 @@
       const pm = ex.promptModules;
       if (!pm.roleTask) pm.roleTask = d.roleTask;
       if (!pm.extractRules) pm.extractRules = d.extractRules;
+      if (pm.rulesUser == null) pm.rulesUser = d.rulesUser;
+      if (pm.rulesAssistant == null) pm.rulesAssistant = d.rulesAssistant;
+      if (pm.rulesExclude == null) pm.rulesExclude = d.rulesExclude;
       if (!pm.outputBehavior) pm.outputBehavior = d.outputBehavior;
       if (!Array.isArray(pm.outputFields) || !pm.outputFields.length) pm.outputFields = d.outputFields;
       pm.context = { ...d.context, ...(pm.context || {}) };
       pm.context.currentSession = true;
     }
+    ensureFewShotExamples(ex);
     return ex.promptModules;
   }
 
@@ -257,6 +440,7 @@
     const pm = ensureExtractModules({ extract });
     const ctx = pm.context || {};
     const types = normalizeExtractTypes(extract.types);
+    const examples = ensureFewShotExamples(extract);
     const parts = [];
 
     parts.push("# 角色与任务", "", (pm.roleTask || "").trim(), "");
@@ -278,14 +462,22 @@
       parts.push(`## 历史会话（最近 ${n} 条）`, "", "{{historical_conversations}}", "");
     }
 
-    parts.push("# 记忆提取规则", "", (pm.extractRules || "").trim(), "");
+    parts.push("# 记忆提取规则（提取准则）", "", composeExtractRulesText(pm), "");
 
-    parts.push("# 记忆类型", "", "可提取的记忆类型包括：", "");
-    types.forEach((t, i) => {
-      const desc = t.description ? `：${t.description}` : "";
-      parts.push(`${i + 1}. ${t.name || "未命名"}${desc}`);
-    });
-    parts.push("");
+    const fewShotText = composeFewShotPromptText(examples);
+    if (fewShotText) {
+      parts.push(fewShotText, "");
+    }
+
+    // 记忆类型已从配置页移除，有配置时仍写入最终 Prompt 以保持兼容
+    if (types.length) {
+      parts.push("# 记忆类型", "", "可提取的记忆类型包括：", "");
+      types.forEach((t, i) => {
+        const desc = t.description ? `：${t.description}` : "";
+        parts.push(`${i + 1}. ${t.name || "未命名"}${desc}`);
+      });
+      parts.push("");
+    }
 
     parts.push("# 输出规则", "", (pm.outputBehavior || "").trim(), "");
     parts.push("请严格按照以下 JSON 格式输出：", "", buildExtractOutputSchema(pm.outputFields), "");
@@ -748,22 +940,104 @@
   /** 新建空白智能体调试会话（抽取 / 检索两侧各一份） */
   function blankDebugEnv(modeKey, name, spaceId) {
     const now = new Date().toISOString();
+    const chat = blankChat(modeKey, "默认会话");
     return {
-      id: `session-${modeKey}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      id: `env-${modeKey}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       spaceId: spaceId || "",
       displayName: name || "",
       startedAt: now,
+      library: [],
+      chats: [chat],
+      chatIdx: 0,
+      // 兼容旧读取路径：与当前 chat 镜像（ensureAgentChats 会同步）
+      messages: chat.messages,
+      memories: chat.memories,
+      debugLog: chat.debugLog,
+    };
+  }
+
+  /** 新建空白对话会话（挂在智能体调试环境之下） */
+  function blankChat(modeKey, title) {
+    const now = new Date().toISOString();
+    return {
+      id: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      title: (title || "新会话").trim() || "新会话",
+      startedAt: now,
       messages: [{ role: "user", text: "开始一段新的对话…", at: now }],
       memories: modeKey === "extract" ? [] : null,
-      _seedMemories: [],
-      library: [],
+      _seedMemories: modeKey === "extract" ? [] : null,
+      extractInserted: false, // 本会话抽取结果是否已点「插入记忆库」
+      debugLog: [],
+      lastRunAt: null,
+      lastRunMs: null,
     };
+  }
+
+  /** 确保智能体环境内有 chats[]；旧数据自动迁移为「默认会话」 */
+  function ensureAgentChats(env, modeKey) {
+    if (!env) return null;
+    const key = modeKey || currentModeKey();
+    if (!Array.isArray(env.chats) || !env.chats.length) {
+      env.chats = [
+        {
+          id: env.id || `chat-${Date.now().toString(36)}`,
+          title: env.chatTitle || "默认会话",
+          startedAt: env.startedAt || new Date().toISOString(),
+          messages: Array.isArray(env.messages)
+            ? env.messages
+            : [{ role: "user", text: "开始一段新的对话…", at: new Date().toISOString() }],
+          memories: key === "extract" ? (Array.isArray(env.memories) ? env.memories : []) : env.memories ?? null,
+          _seedMemories: env._seedMemories ?? (key === "extract" ? [] : null),
+          debugLog: Array.isArray(env.debugLog) ? env.debugLog : [],
+          lastRunAt: env.lastRunAt || null,
+          lastRunMs: env.lastRunMs ?? null,
+        },
+      ];
+      env.chatIdx = 0;
+    }
+    env.chatIdx = Math.min(Math.max(0, Number(env.chatIdx) || 0), env.chats.length - 1);
+    const chat = env.chats[env.chatIdx];
+    // 镜像到环境顶层，兼容尚未改完的读取路径
+    if (chat) {
+      env.messages = chat.messages;
+      env.memories = chat.memories;
+      env.debugLog = chat.debugLog;
+      env.lastRunAt = chat.lastRunAt;
+      env.lastRunMs = chat.lastRunMs;
+    }
+    return env;
+  }
+
+  function currentAgentEnv() {
+    const list = ensurePgSessions()[currentModeKey()] || [];
+    if (!list.length) return null;
+    let idx = Math.min(Math.max(0, state.pgSessionIdx), list.length - 1);
+    state.pgSessionIdx = idx;
+    const env = list[idx];
+    ensureAgentChats(env);
+    return env;
+  }
+
+  function agentChatList(env) {
+    const e = env || currentAgentEnv();
+    if (!e) return [];
+    ensureAgentChats(e);
+    return e.chats || [];
+  }
+
+  function chatListName(chat, index) {
+    if (chat?.title?.trim()) return chat.title.trim();
+    if (chat?.displayName?.trim()) return chat.displayName.trim();
+    const first = sessionFirstContent(chat);
+    if (first) return truncate(first, 28);
+    return `会话 ${Number(index) + 1}`;
   }
 
   /**
    * 调试会话与智能体（记忆空间）一一对应：
    * - 列表 = accessibleSpaces()
    * - 两侧 extract/generate 按 spaceId 对齐，共享选中下标与记忆库（挂 generate）
+   * - 每个智能体下可有多个对话会话（chats）
    */
   function syncDebugEnvsWithAgents() {
     const bag = state.pgSessions;
@@ -787,6 +1061,8 @@
       g.spaceId = agent.id;
       e.displayName = agent.name;
       g.displayName = agent.name;
+      ensureAgentChats(e, "extract");
+      ensureAgentChats(g, "generate");
       if (!Array.isArray(g.library) || !g.library.length) {
         g.library = Array.isArray(e.library) && e.library.length ? e.library : seedDebugLibrary("generate", i);
       }
@@ -1077,10 +1353,10 @@
   }
 
   function currentSession() {
-    const sessions = ensurePgSessions()[currentModeKey()];
-    const idx = Math.min(state.pgSessionIdx, sessions.length - 1);
-    state.pgSessionIdx = Math.max(0, idx);
-    return sessions[state.pgSessionIdx];
+    const env = currentAgentEnv();
+    if (!env) return null;
+    ensureAgentChats(env);
+    return env.chats[env.chatIdx] || env.chats[0] || null;
   }
 
   function sessionFirstContent(session) {
@@ -1425,7 +1701,7 @@
   function enterAs(user, { silent = false } = {}) {
     state.user = { ...user };
     state.viewMode = user.role === "user" ? "user" : "admin";
-    state.page = user.role === "user" ? "memories" : "monitor";
+    state.page = "memories";
     const spaces = accessibleSpaces();
     state.spaceId = spaces[0]?.id || null;
     state.selectedUserId = user.role === "user" ? user.id : "u-sarah";
@@ -1892,10 +2168,6 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33h.01a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51h.01a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.01a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
             参数配置
           </button>
-          <button type="button" class="btn btn-primary btn-sm cfg-env-new" id="pg-env-new" title="新建智能体">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-            新建智能体
-          </button>
         </div>
       </div>`;
     };
@@ -1928,7 +2200,6 @@
     };
 
     const bindBar = () => {
-      $("#pg-env-new")?.addEventListener("click", () => openAgentFormModal(null));
       bindEnvPicker();
       // Tab 行右侧：智能体切换 + 参数配置弹窗
       $("#pg-cfg-open")?.addEventListener("click", () => openDebugCfgModal(space));
@@ -2120,14 +2391,22 @@
   function writeExtractToConfig(body, cfg) {
     if (!cfg?.extract) return false;
     const modelEl = $("#ex-model", body);
-    const modular = !!(body.querySelector("[data-ex-panel]") || $("#ex-extract-rules", body));
+    const modular = !!(
+      body.querySelector("[data-ex-panel]") ||
+      $("#ex-extract-rules", body) ||
+      $("#ex-rules-user", body)
+    );
     if (!modelEl && !modular && !$("#ex-prompt", body)) return false;
     if (modelEl) cfg.extract.model = modelEl.value;
     if (modular) {
       const pm = ensureExtractModules(cfg);
       // 角色与任务 / 输出规则已从 UI 隐藏，保留默认值参与最终 Prompt 拼接
       if ($("#ex-role-task", body)) pm.roleTask = $("#ex-role-task", body).value;
-      pm.extractRules = $("#ex-extract-rules", body)?.value ?? pm.extractRules;
+      if ($("#ex-rules-user", body)) pm.rulesUser = $("#ex-rules-user", body).value;
+      if ($("#ex-rules-assistant", body)) pm.rulesAssistant = $("#ex-rules-assistant", body).value;
+      if ($("#ex-rules-exclude", body)) pm.rulesExclude = $("#ex-rules-exclude", body).value;
+      // 同步旧字段，便于兼容读取
+      pm.extractRules = composeExtractRulesText(pm) || pm.extractRules;
       if ($("#ex-output-behavior", body)) pm.outputBehavior = $("#ex-output-behavior", body).value;
       const ctx = pm.context;
       ctx.currentSession = true;
@@ -2275,47 +2554,23 @@
   }
 
 
-  function renderExtractModNav(active) {
-    const mods = [
-      ["rules", "1", "提取规则"],
-      ["context", "2", "上下文配置"],
-    ];
-    return `
-      <div class="pe-mod-steps-row">
-        <nav class="pe-mod-steps" aria-label="Prompt 组件">
-          ${mods
-            .map(
-              ([id, num, label], i) => `
-            <button type="button" class="pe-mod-step ${active === id ? "active" : ""}" data-ex-mod="${id}">
-              <i class="pe-mod-num">${num}</i>
-              <span>${label}</span>
-            </button>
-            ${i < mods.length - 1 ? `<span class="pe-mod-sep" aria-hidden="true"></span>` : ""}`
-            )
-            .join("")}
-        </nav>
-        <button type="button" class="btn btn-secondary btn-sm pe-mod-final-btn" id="ex-view-final-prompt">查看最终 Prompt</button>
-      </div>`;
-  }
-
   function renderExtractForm(cfg, locked) {
     const dis = locked ? "disabled" : "";
     ensureExtractModules(cfg);
     const pm = cfg.extract.promptModules;
-    const ctx = pm.context;
-    const types = normalizeExtractTypes(cfg.extract.types);
-    let active = state.extractPromptMod || "rules";
-    // 记忆类型已并入提取规则；角色/输出改为内置默认，不在步骤中展示
-    if (active === "types" || active === "role" || active === "output") active = "rules";
-    if (active !== "context" && active !== "rules") active = "rules";
-    state.extractPromptMod = active;
-    const convCustom = String(ctx.historyConvRange) === "custom";
-    const rulesLen = (pm.extractRules || "").length;
-
-    const panel = (id, html) => `
-      <div class="pe-mod-panel ${active === id ? "is-active" : ""}" data-ex-panel="${id}" ${active === id ? "" : "hidden"}>
-        ${html}
-      </div>`;
+    const examples = ensureFewShotExamples(cfg.extract);
+    state.extractPromptMod = "rules";
+    const ruleField = (id, title, value, rows = 6) => {
+      const len = (value || "").length;
+      return `
+        <label class="pe-rule-field">
+          <span class="pe-rule-label">${title}</span>
+          <div class="textarea-wrap">
+            <textarea class="textarea" rows="${rows}" id="${id}" maxlength="6000" ${dis}>${esc(value || "")}</textarea>
+            <span class="field-count">${len}/6000</span>
+          </div>
+        </label>`;
+    };
 
     return `
       <div class="pe-form pe-extract-modular">
@@ -2328,101 +2583,583 @@
               .join("")}
           </select>`
         )}
-        ${renderExtractModNav(active)}
-        <div class="pe-mod-body">
-            ${panel(
-              "rules",
-              `<p class="pe-mod-hint">核心业务规则：什么该提取、什么不该提取；下方配置可提取的记忆类型。</p>
-              <label class="field pe-prompt-block pe-prompt-block-rules">
-                <span class="sr-only">提取规则 Prompt</span>
-                <div class="textarea-wrap">
-                  <textarea class="textarea" rows="10" id="ex-extract-rules" maxlength="6000" ${dis}>${esc(pm.extractRules || "")}</textarea>
-                  <span class="field-count">${rulesLen}/6000</span>
-                </div>
-              </label>
-              <div class="pe-types-under-rules">
-                <div class="pe-types-under-hd">记忆类型</div>
-                <div class="pe-types-block">${renderExtractTypesList(types, locked)}</div>
-              </div>`
-            )}
-            ${panel(
-              "context",
-              `<p class="pe-mod-hint">选择注入 Prompt 的上下文变量；当前会话为必选输入。</p>
-              <div class="pe-ctx-list">
-                <div class="pe-ctx-row is-locked">
-                  <div class="pe-ctx-main">
-                    <strong>当前会话</strong>
-                    <span>本次提取的主要输入</span>
-                  </div>
-                  <em class="pe-ctx-badge">已启用</em>
-                  <input type="hidden" id="ex-ctx-session" value="1" />
-                </div>
-                <label class="pe-ctx-row">
-                  <div class="pe-ctx-main">
-                    <strong>用户画像</strong>
-                    <span>帮助模型理解用户身份</span>
-                  </div>
-                  <input type="checkbox" id="ex-ctx-profile" ${ctx.userProfile ? "checked" : ""} ${dis} />
-                </label>
-                <label class="pe-ctx-row">
-                  <div class="pe-ctx-main">
-                    <strong>时间信息</strong>
-                    <span>用于理解「最近」等相对时间</span>
-                  </div>
-                  <input type="checkbox" id="ex-ctx-time" ${ctx.currentTime ? "checked" : ""} ${dis} />
-                </label>
-                <div class="pe-ctx-row pe-ctx-row-stack">
-                  <label class="pe-ctx-row-inner">
-                    <div class="pe-ctx-main">
-                      <strong>历史记忆</strong>
-                      <span>注入检索召回结果</span>
-                    </div>
-                    <input type="checkbox" id="ex-ctx-memories" ${ctx.historyMemories ? "checked" : ""} ${dis} />
-                  </label>
-                  <div class="pe-ctx-deps ${ctx.historyMemories ? "" : "hidden"}" id="ex-ctx-mem-deps">
-                    <div class="pe-row pe-ctx-dep-row">
-                      <div class="pe-row-meta">
-                        <strong>召回条数上限</strong>
-                        <span>仅注入检索召回结果的前若干条，控制 Prompt 体积</span>
-                      </div>
-                      <div class="pe-row-ctrl">
-                        <input type="number" class="input pe-num" id="ex-ctx-mem-topk" min="1" max="50" value="${Number(ctx.historyMemoryTopK) || 5}" ${dis} />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <div class="pe-ctx-row pe-ctx-row-stack">
-                  <label class="pe-ctx-row-inner">
-                    <div class="pe-ctx-main">
-                      <strong>历史会话</strong>
-                      <span>追溯近期对话</span>
-                    </div>
-                    <input type="checkbox" id="ex-ctx-convs" ${ctx.historyConversations ? "checked" : ""} ${dis} />
-                  </label>
-                  <div class="pe-ctx-deps ${ctx.historyConversations ? "" : "hidden"}" id="ex-ctx-conv-deps">
-                    <div class="pe-row pe-ctx-dep-row">
-                      <div class="pe-row-meta">
-                        <strong>追溯范围</strong>
-                        <span>注入最近若干条历史会话到 Prompt</span>
-                      </div>
-                      <div class="pe-row-ctrl pe-ctx-dep-ctrl">
-                        <select class="select pe-ctx-select" id="ex-ctx-conv-range" ${dis}>
-                          ${["5", "10", "20", "custom"]
-                            .map((v) => {
-                              const lab = v === "custom" ? "自定义" : `最近 ${v} 条`;
-                              return `<option value="${v}" ${String(ctx.historyConvRange) === v ? "selected" : ""}>${lab}</option>`;
-                            })
-                            .join("")}
-                        </select>
-                        <input type="number" class="input pe-num ${convCustom ? "" : "hidden"}" id="ex-ctx-conv-custom" min="1" max="100" value="${Number(ctx.historyConvCustom) || 10}" ${dis} title="自定义条数" />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>`
-            )}
+        <div class="pe-rules-group">
+          <div class="pe-rules-group-hd">
+            <strong>提取准则</strong>
+            <span>分三部分配置可提取与不可记录的内容</span>
+          </div>
+          <div class="pe-rules-fields" role="group" aria-label="提取准则子项">
+            ${ruleField("ex-rules-user", "用户消息中可提取的内容", pm.rulesUser, 7)}
+            ${ruleField("ex-rules-assistant", "助手消息中可提取的内容", pm.rulesAssistant, 4)}
+            ${ruleField("ex-rules-exclude", "禁止提取的内容", pm.rulesExclude, 6)}
+          </div>
+        </div>
+        ${renderFewShotSection(examples, locked)}
+        <div class="pe-extract-ft">
+          <button type="button" class="btn btn-primary" id="ex-view-final-prompt" title="查看当前配置组装后的最终 Prompt">查看最终 Prompt</button>
         </div>
       </div>`;
+  }
+
+  function renderFewShotSection(examples, locked) {
+    const list = Array.isArray(examples) ? examples : [];
+    return `
+      <div class="pe-rules-group pe-fewshot-group" id="ex-fewshot-section">
+        <div class="pe-fewshot-hd">
+          <div class="pe-rules-group-hd">
+            <strong>提取示例（Few-shot）</strong>
+            <span>通过多轮对话示例帮助模型理解记忆提取规则。所有已添加示例都会自动加入最终 Prompt。</span>
+          </div>
+          <div class="pe-fewshot-actions">
+            <span class="pe-fewshot-count" id="ex-fewshot-count">共 ${list.length} 个示例</span>
+            ${
+              locked
+                ? ""
+                : `<button type="button" class="btn btn-secondary btn-sm" id="ex-fewshot-add">+ 添加示例</button>`
+            }
+          </div>
+        </div>
+        <div class="pe-fewshot-list" id="ex-fewshot-list" role="list" aria-label="提取示例列表">
+          ${
+            list.length
+              ? list.map((ex, i) => renderFewShotCard(ex, i, locked)).join("")
+              : `<div class="pe-fewshot-empty">暂无提取示例。添加后将自动写入最终 Prompt。</div>`
+          }
+        </div>
+      </div>`;
+  }
+
+  function renderFewShotCard(ex, idx, locked) {
+    const turns = fewShotTurnCount(ex);
+    const mems = fewShotMemoryCount(ex);
+    const preview = fewShotPreviewText(ex);
+    const previewHtml = preview
+      ? `<p class="pe-fewshot-preview">示例内容：${esc(preview.length > 72 ? `${preview.slice(0, 72)}…` : preview)}</p>`
+      : "";
+    return `
+      <article class="pe-fewshot-card" data-fs-id="${esc(ex.id)}" data-fs-idx="${idx}" role="listitem">
+        ${locked ? "" : `<span class="pe-fewshot-drag" draggable="true" title="拖动排序" aria-label="拖动排序">⋮⋮</span>`}
+        <button type="button" class="pe-fewshot-main" data-fs-edit="${esc(ex.id)}" ${locked ? "disabled" : ""}>
+          <div class="pe-fewshot-title-row">
+            <strong class="pe-fewshot-name">${esc(ex.name || `示例 ${idx + 1}`)}</strong>
+          </div>
+          <div class="pe-fewshot-meta">${turns} 轮对话 · ${mems} 条记忆</div>
+          ${previewHtml}
+        </button>
+        ${
+          locked
+            ? ""
+            : `<div class="pe-fewshot-more-wrap">
+                <button type="button" class="pe-fewshot-more" data-fs-more="${esc(ex.id)}" aria-label="更多操作" aria-haspopup="menu" aria-expanded="false" title="更多">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
+                </button>
+                <div class="pe-fewshot-menu hidden" data-fs-menu="${esc(ex.id)}" role="menu">
+                  <button type="button" role="menuitem" class="is-danger" data-fs-del="${esc(ex.id)}">删除</button>
+                </div>
+              </div>`
+        }
+      </article>`;
+  }
+
+  function refreshFewShotSection(body, cfg, locked) {
+    const section = $("#ex-fewshot-section", body);
+    if (!section || !cfg?.extract) return;
+    const examples = ensureFewShotExamples(cfg.extract);
+    const wrap = document.createElement("div");
+    wrap.innerHTML = renderFewShotSection(examples, locked).trim();
+    const next = wrap.firstElementChild;
+    if (!next) return;
+    section.replaceWith(next);
+    bindFewShotSection(body, cfg, locked);
+  }
+
+  function syncExtractPromptFromExamples(cfg) {
+    if (!cfg?.extract) return;
+    ensureExtractModules(cfg);
+    cfg.extract.prompt = compileExtractPrompt(cfg.extract);
+  }
+
+  function getActiveExtractCfg(formRoot) {
+    const space = spaceById(state.spaceId) || accessibleSpaces()[0];
+    if (!space) return null;
+    const inDbg = !!(
+      formRoot?.closest?.("#dbg-cfg-modal") ||
+      formRoot?.id === "dbg-cfg-pane" ||
+      formRoot?.id === "dbg-cfg-modal" ||
+      (formRoot && $("#dbg-cfg-modal", formRoot))
+    );
+    const cfg = inDbg ? space.config : activeEngineVersion(space)?.config || space.config;
+    if (!cfg.extract) cfg.extract = {};
+    ensureExtractModules(cfg);
+    return { space, cfg, extract: cfg.extract };
+  }
+
+  function afterFewShotChange(cfg) {
+    syncExtractPromptFromExamples(cfg);
+    const space = spaceById(state.spaceId);
+    if (space) {
+      const ver = activeEngineVersion(space);
+      // 当前空间配置版本：同步回 space.config，保证「查看最终 Prompt」一致
+      if (ver?.id === "preset-current" && ver.config === cfg) {
+        if (!space.config) space.config = {};
+        space.config.extract = cloneConfig(cfg.extract);
+      }
+    }
+    if (typeof markParamsDirty === "function") markParamsDirty();
+  }
+
+  function blankFewShotExample() {
+    return {
+      id: `fs-${Date.now()}`,
+      name: "",
+      includeInPrompt: true,
+      messages: [
+        { role: "user", content: "", included: true },
+        { role: "assistant", content: "", included: true },
+      ],
+      memories: [{ content: "", rationale: "" }],
+    };
+  }
+
+  function openFewShotEditor(exampleId, locked, formRoot) {
+    const ctx = getActiveExtractCfg(formRoot);
+    if (!ctx) return;
+    const { cfg, extract } = ctx;
+    const examples = ensureFewShotExamples(extract);
+    const isNew = !exampleId;
+    let draft;
+    if (isNew) {
+      draft = blankFewShotExample();
+    } else {
+      const found = examples.find((e) => e.id === exampleId);
+      if (!found) return;
+      draft = cloneConfig(found);
+    }
+    if (!Array.isArray(draft.messages)) draft.messages = [];
+    if (!Array.isArray(draft.memories)) draft.memories = [];
+    draft.messages = ensureFewShotMessagePairs(draft.messages);
+
+    openAppDrawer({
+      title: isNew ? "添加提取示例" : "编辑提取示例",
+      wide: true,
+      html: renderFewShotEditorHtml(draft, locked),
+    });
+    bindFewShotEditor(draft, locked, isNew, cfg, formRoot);
+  }
+
+  function renderFewShotEditorHtml(draft, locked) {
+    const dis = locked ? "disabled" : "";
+    const name = draft.name || "";
+    return `
+      <div class="fs-editor" id="fs-editor">
+        <div class="fs-tip">
+          <p>通过真实对话示例，让大模型学习如何从对话中提取记忆。</p>
+          <p>已添加的示例将自动加入最终 Prompt。</p>
+        </div>
+
+        <label class="field fs-name-field">
+          <span class="fs-req">示例名称</span>
+          <div class="fs-input-wrap">
+            <input type="text" class="input" id="fs-name" maxlength="50" placeholder="例如：用户偏好提取示例" value="${esc(name)}" ${dis} />
+            <em class="field-count" id="fs-name-count">${name.length}/50</em>
+          </div>
+        </label>
+
+        <section class="fs-block">
+          <div class="fs-block-hd is-split">
+            <strong>对话内容</strong>
+            ${
+              locked
+                ? ""
+                : `<button type="button" class="fs-link-btn" id="fs-add-turn">+ 添加对话</button>`
+            }
+          </div>
+          <div class="fs-msg-list" id="fs-msg-list">
+            ${(draft.messages || []).map((m, i) => renderFewShotMsgRow(m, i, locked)).join("")}
+          </div>
+        </section>
+
+        <section class="fs-block">
+          <div class="fs-block-hd is-split">
+            <div>
+              <strong>期望结果</strong>
+              <span>期望从该对话提取出的记忆，并可添加说明</span>
+            </div>
+            ${
+              locked
+                ? ""
+                : `<button type="button" class="fs-link-btn" id="fs-add-mem">+ 添加记忆</button>`
+            }
+          </div>
+          <div class="fs-mem-list" id="fs-mem-list">
+            ${(draft.memories || []).length
+              ? (draft.memories || []).map((m, i) => renderFewShotMemRow(m, i, locked)).join("")
+              : `<div class="fs-mem-empty" id="fs-mem-empty">暂无需要提取的记忆。可添加记忆，或保持为空作为无记忆示例。</div>`}
+          </div>
+        </section>
+
+        <div class="fs-editor-ft">
+          <button type="button" class="btn btn-secondary" id="fs-cancel">取消</button>
+          ${
+            locked
+              ? ""
+              : `<button type="button" class="btn btn-primary" id="fs-save">保存示例</button>`
+          }
+        </div>
+      </div>`;
+  }
+
+  function renderFewShotMsgRow(msg, idx, locked) {
+    const role = String(msg?.role || "user").toLowerCase() === "assistant" ? "assistant" : "user";
+    const dis = locked ? "disabled" : "";
+    return `
+      <div class="fs-msg-row is-${role}" data-fs-msg-idx="${idx}" data-role="${role}">
+        <span class="fs-msg-idx">${idx + 1}</span>
+        <button type="button" class="fs-role-pill is-${role}" data-fs-msg-role ${dis} title="点击切换角色">${role === "assistant" ? "ASSISTANT" : "USER"}</button>
+        <input type="text" class="input fs-msg-content" data-fs-msg-content maxlength="200" placeholder="输入对话内容…" value="${esc(msg?.content || "")}" ${dis} />
+        ${
+          locked
+            ? ""
+            : `<button type="button" class="fs-msg-del" data-fs-msg-del title="删除这轮对话" aria-label="删除这轮对话">×</button>`
+        }
+      </div>`;
+  }
+
+  function renderFewShotMemRow(mem, idx, locked) {
+    const dis = locked ? "disabled" : "";
+    const content = mem?.content || "";
+    const rationale = mem?.rationale || "";
+    return `
+      <div class="fs-mem-card" data-fs-mem-idx="${idx}">
+        <div class="fs-mem-hd">
+          <strong>记忆 ${idx + 1}</strong>
+          ${
+            locked
+              ? ""
+              : `<button type="button" class="icon-btn is-danger" data-fs-mem-del title="删除记忆" aria-label="删除记忆">🗑</button>`
+          }
+        </div>
+        <div class="textarea-wrap">
+          <textarea class="textarea fs-mem-ta" data-fs-mem-content rows="1" maxlength="100" placeholder="例如：用户偏好简洁的回答方式。" ${dis}>${esc(content)}</textarea>
+          <em class="field-count">${content.length}/100</em>
+        </div>
+        <label class="field">
+          <span>解释说明</span>
+          <div class="textarea-wrap">
+            <textarea class="textarea fs-mem-ta" data-fs-mem-rationale rows="1" maxlength="200" placeholder="例如：用户明确表达了对回答长度和信息密度的长期偏好…" ${dis}>${esc(rationale)}</textarea>
+            <em class="field-count">${rationale.length}/200</em>
+          </div>
+        </label>
+      </div>`;
+  }
+
+  function openAppDrawer({ title, html, wide }) {
+    const drawer = $("#detail-drawer");
+    const body = $("#drawer-body");
+    const titleEl = $("#drawer-title");
+    if (!drawer || !body || !titleEl) return;
+    $("#drawer-backdrop")?.classList.remove("hidden");
+    drawer.classList.remove("hidden");
+    drawer.classList.toggle("is-wide", !!wide);
+    drawer.setAttribute("aria-hidden", "false");
+    titleEl.textContent = title || "详情";
+    body.innerHTML = html || "";
+  }
+
+  function closeAppDrawer() {
+    const drawer = $("#detail-drawer");
+    drawer?.classList.add("hidden");
+    drawer?.classList.remove("is-wide");
+    drawer?.setAttribute("aria-hidden", "true");
+    $("#drawer-backdrop")?.classList.add("hidden");
+    const body = $("#drawer-body");
+    if (body) body.innerHTML = "";
+  }
+
+  function readFewShotDraftFromDom(draft) {
+    const root = $("#fs-editor");
+    if (!root) return draft;
+    draft.name = ($("#fs-name", root)?.value || "").trim();
+    const msgs = [];
+    $$("[data-fs-msg-idx]", root).forEach((card) => {
+      msgs.push({
+        role: card.dataset.role === "assistant" ? "assistant" : "user",
+        content: $("[data-fs-msg-content]", card)?.value || "",
+        included: true,
+      });
+    });
+    draft.messages = msgs;
+    const mems = [];
+    $$("[data-fs-mem-idx]", root).forEach((card) => {
+      mems.push({
+        content: $("[data-fs-mem-content]", card)?.value || "",
+        rationale: $("[data-fs-mem-rationale]", card)?.value || "",
+      });
+    });
+    draft.memories = mems;
+    return draft;
+  }
+
+  function rerenderFewShotEditor(draft, locked, isNew, cfg, formRoot) {
+    const body = $("#drawer-body");
+    if (!body) return;
+    body.innerHTML = renderFewShotEditorHtml(draft, locked);
+    bindFewShotEditor(draft, locked, isNew, cfg, formRoot);
+  }
+
+  function bindFewShotEditor(draft, locked, isNew, cfg, formRoot) {
+    const root = $("#fs-editor");
+    if (!root) return;
+
+    $("#fs-cancel", root)?.addEventListener("click", () => closeAppDrawer());
+
+    const syncCount = (el) => {
+      const wrap = el.closest(".textarea-wrap, .fs-input-wrap");
+      const count = wrap?.querySelector(".field-count");
+      const max = el.getAttribute("maxlength");
+      if (count && max) count.textContent = `${el.value.length}/${max}`;
+    };
+    const fitFsTextarea = (el) => {
+      if (!el || el.tagName !== "TEXTAREA") return;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(Math.max(el.scrollHeight, 32), 64)}px`;
+    };
+    root.querySelectorAll(".fs-mem-ta").forEach(fitFsTextarea);
+    root.addEventListener("input", (e) => {
+      if (e.target.matches("#fs-name, .fs-mem-ta")) syncCount(e.target);
+      if (e.target.matches(".fs-mem-ta")) fitFsTextarea(e.target);
+    });
+
+    if (locked) return;
+
+    const syncDraft = () => readFewShotDraftFromDom(draft);
+
+    const setMsgRole = (row, role) => {
+      row.dataset.role = role;
+      row.classList.toggle("is-user", role === "user");
+      row.classList.toggle("is-assistant", role === "assistant");
+      const pill = $("[data-fs-msg-role]", row);
+      if (pill) {
+        pill.classList.toggle("is-user", role === "user");
+        pill.classList.toggle("is-assistant", role === "assistant");
+        pill.textContent = role === "assistant" ? "ASSISTANT" : "USER";
+      }
+    };
+
+    root.addEventListener("click", (e) => {
+      if (e.target.closest("#fs-add-turn")) {
+        syncDraft();
+        draft.messages.push(
+          { role: "user", content: "", included: true },
+          { role: "assistant", content: "", included: true }
+        );
+        rerenderFewShotEditor(draft, locked, isNew, cfg, formRoot);
+        return;
+      }
+      const roleBtn = e.target.closest("[data-fs-msg-role]");
+      if (roleBtn) {
+        const row = roleBtn.closest("[data-fs-msg-idx]");
+        if (row) setMsgRole(row, row.dataset.role === "assistant" ? "user" : "assistant");
+        return;
+      }
+      const msgCard = e.target.closest("[data-fs-msg-idx]");
+      if (msgCard && e.target.closest("[data-fs-msg-del]")) {
+        const idx = Number(msgCard.dataset.fsMsgIdx);
+        syncDraft();
+        draft.messages.splice(idx, 1);
+        rerenderFewShotEditor(draft, locked, isNew, cfg, formRoot);
+        return;
+      }
+      if (e.target.closest("#fs-add-mem")) {
+        syncDraft();
+        draft.memories.push({ content: "", rationale: "" });
+        rerenderFewShotEditor(draft, locked, isNew, cfg, formRoot);
+        return;
+      }
+      const memCard = e.target.closest("[data-fs-mem-idx]");
+      if (memCard && e.target.closest("[data-fs-mem-del]")) {
+        const idx = Number(memCard.dataset.fsMemIdx);
+        syncDraft();
+        draft.memories.splice(idx, 1);
+        rerenderFewShotEditor(draft, locked, isNew, cfg, formRoot);
+      }
+    });
+
+    $("#fs-save", root)?.addEventListener("click", () => {
+      syncDraft();
+      const name = (draft.name || "").trim();
+      if (!name) {
+        toast("请填写示例名称");
+        $("#fs-name", root)?.focus();
+        return;
+      }
+      if (!draft.messages.length) {
+        toast("请至少添加一条对话消息");
+        return;
+      }
+      const hasContent = draft.messages.some((m) => String(m.content || "").trim());
+      if (!hasContent) {
+        toast("请填写对话内容");
+        return;
+      }
+      // 允许 0 条记忆；清理完全空白的记忆行
+      draft.memories = (draft.memories || []).filter(
+        (m) => String(m.content || "").trim() || String(m.rationale || "").trim()
+      );
+      draft.name = name;
+
+      const examples = ensureFewShotExamples(cfg.extract);
+      if (isNew) {
+        examples.push(draft);
+      } else {
+        const idx = examples.findIndex((e) => e.id === draft.id);
+        if (idx >= 0) examples[idx] = draft;
+        else examples.push(draft);
+      }
+      afterFewShotChange(cfg);
+      closeAppDrawer();
+      const host = formRoot || $("#ex-fewshot-section")?.closest(".pe-form")?.parentElement || document;
+      refreshFewShotSection(host, cfg, false);
+      toast(isNew ? "已添加示例，并加入最终 Prompt" : "已更新示例，最终 Prompt 已同步");
+    });
+  }
+
+  function confirmDeleteFewShot(exampleId, cfg, locked, formRoot) {
+    const examples = ensureFewShotExamples(cfg.extract);
+    const ex = examples.find((e) => e.id === exampleId);
+    if (!ex) return;
+    const host = $("#modal-host");
+    if (!host) return;
+    host.innerHTML = `
+      <div class="modal-backdrop" id="fs-del-modal">
+        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="fs-del-title">
+          <div class="modal-hd">
+            <h3 id="fs-del-title">删除提取示例？</h3>
+            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-bd">
+            <p class="modal-desc">删除后，该示例将同时从最终 Prompt 中移除，是否继续？</p>
+            <p class="modal-desc" style="margin-top:8px;color:var(--ink-3)">示例：${esc(ex.name || "未命名")}</p>
+          </div>
+          <div class="modal-ft">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="button" class="btn btn-danger" id="modal-confirm-delete">删除示例</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => {
+      host.innerHTML = "";
+    };
+    $("#modal-x", host).onclick = close;
+    $("#modal-cancel", host).onclick = close;
+    $("#fs-del-modal", host).addEventListener("click", (e) => {
+      if (e.target.id === "fs-del-modal") close();
+    });
+    $("#modal-confirm-delete", host).onclick = () => {
+      const idx = examples.findIndex((e) => e.id === exampleId);
+      if (idx >= 0) examples.splice(idx, 1);
+      afterFewShotChange(cfg);
+      close();
+      refreshFewShotSection(formRoot || document, cfg, locked);
+      toast("已删除示例，最终 Prompt 已更新");
+    };
+  }
+
+  function bindFewShotSection(body, cfg, locked) {
+    const section = $("#ex-fewshot-section", body);
+    if (!section || section.dataset.bound === "1") return;
+    section.dataset.bound = "1";
+
+    section.addEventListener("click", (e) => {
+      const addBtn = e.target.closest("#ex-fewshot-add");
+      if (addBtn) {
+        e.preventDefault();
+        writeExtractToConfig(body, cfg);
+        openFewShotEditor(null, locked, body);
+        return;
+      }
+      const more = e.target.closest("[data-fs-more]");
+      if (more) {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = more.dataset.fsMore;
+        const menu = section.querySelector(`[data-fs-menu="${CSS.escape(id)}"]`);
+        const open = menu && !menu.classList.contains("hidden");
+        section.querySelectorAll("[data-fs-menu]").forEach((m) => m.classList.add("hidden"));
+        section.querySelectorAll("[data-fs-more]").forEach((b) => b.setAttribute("aria-expanded", "false"));
+        if (!open && menu) {
+          menu.classList.remove("hidden");
+          more.setAttribute("aria-expanded", "true");
+        }
+        return;
+      }
+      const del = e.target.closest("[data-fs-del]");
+      if (del) {
+        e.preventDefault();
+        e.stopPropagation();
+        confirmDeleteFewShot(del.dataset.fsDel, cfg, locked, body);
+        return;
+      }
+      const edit = e.target.closest("[data-fs-edit]");
+      if (edit && !locked) {
+        e.preventDefault();
+        writeExtractToConfig(body, cfg);
+        openFewShotEditor(edit.dataset.fsEdit, locked, body);
+      }
+    });
+
+    if (!locked) {
+      let dragId = null;
+      section.addEventListener("dragstart", (e) => {
+        const handle = e.target.closest(".pe-fewshot-drag");
+        const card = e.target.closest(".pe-fewshot-card");
+        if (!handle || !card) {
+          e.preventDefault();
+          return;
+        }
+        dragId = card.dataset.fsId;
+        card.classList.add("is-dragging");
+        e.dataTransfer?.setData("text/plain", dragId);
+        e.dataTransfer.effectAllowed = "move";
+      });
+      section.addEventListener("dragend", (e) => {
+        e.target.closest(".pe-fewshot-card")?.classList.remove("is-dragging");
+        section.querySelectorAll(".pe-fewshot-card.is-drag-over").forEach((c) => c.classList.remove("is-drag-over"));
+        dragId = null;
+      });
+      section.addEventListener("dragover", (e) => {
+        const card = e.target.closest(".pe-fewshot-card");
+        if (!card || !dragId || card.dataset.fsId === dragId) return;
+        e.preventDefault();
+        section.querySelectorAll(".pe-fewshot-card.is-drag-over").forEach((c) => c.classList.remove("is-drag-over"));
+        card.classList.add("is-drag-over");
+      });
+      section.addEventListener("drop", (e) => {
+        const card = e.target.closest(".pe-fewshot-card");
+        if (!card || !dragId) return;
+        e.preventDefault();
+        const targetId = card.dataset.fsId;
+        if (targetId === dragId) return;
+        const examples = ensureFewShotExamples(cfg.extract);
+        const from = examples.findIndex((x) => x.id === dragId);
+        const to = examples.findIndex((x) => x.id === targetId);
+        if (from < 0 || to < 0) return;
+        const [item] = examples.splice(from, 1);
+        examples.splice(to, 0, item);
+        afterFewShotChange(cfg);
+        refreshFewShotSection(body, cfg, locked);
+        toast("示例顺序已更新，最终 Prompt 已同步");
+      });
+    }
+
+    if (!document._fewShotDocBound) {
+      document._fewShotDocBound = true;
+      document.addEventListener("click", (e) => {
+        if (e.target.closest("[data-fs-more], [data-fs-menu]")) return;
+        document.querySelectorAll("[data-fs-menu]").forEach((m) => m.classList.add("hidden"));
+        document.querySelectorAll("[data-fs-more]").forEach((b) => b.setAttribute("aria-expanded", "false"));
+      });
+    }
   }
 
   function ensureRetrieve(cfg) {
@@ -2516,7 +3253,6 @@
   function renderRetrieveForm(cfg, locked) {
     const r = ensureRetrieve(cfg);
     const dis = locked ? "disabled" : "";
-    const rewrite = r.rewritePrompt || "";
     const vecOn = methodOn(r, "vector");
     const kwOn = methodOn(r, "keyword");
     const rerankOn = r.rerankEnabled !== false && r.rerankModel !== "rerank-off";
@@ -2538,13 +3274,6 @@
       </div>`;
     return `
       <div class="pe-form">
-        <label class="field pe-prompt-block">
-          <span>问题改写提示词</span>
-          <div class="textarea-wrap">
-            <textarea class="textarea" rows="3" id="rt-rewrite" maxlength="2000" ${dis}>${esc(rewrite)}</textarea>
-            <span class="field-count">${rewrite.length}/2000</span>
-          </div>
-        </label>
         ${peRow(
           "召回 Top-K",
           "每次检索最终返回的记忆条数",
@@ -2647,8 +3376,7 @@
     const isExtract = state.debugMode !== "generate";
     if (!isExtract) return renderRetrievePlayground(space);
     ensurePgSessions();
-    const sessions = state.pgSessions[currentModeKey()];
-    const curSess = sessions[state.pgSessionIdx] || sessions[0];
+    const curSess = currentSession();
     const outView = state.outView === "graph" ? "graph" : "output";
     const lastAt = state.lastRunAt || curSess?.lastRunAt;
     const lastMs = state.lastRunMs ?? curSess?.lastRunMs ?? null;
@@ -2674,6 +3402,7 @@
                   <button type="button" data-msgview="file" class="${state.msgView === "file" ? "active" : ""}">文件导入</button>
                 </div>
               </div>
+              ${renderChatPickerHtml()}
             </div>
             <div class="msg-list ${state.msgView === "json" || state.msgView === "file" ? "hidden" : ""}" id="chat-stream"></div>
             <textarea class="pg-json ${state.msgView === "json" ? "" : "hidden"}" id="chat-json" spellcheck="false"></textarea>
@@ -2699,7 +3428,7 @@
                 <span>上次运行 ${esc(formatLastRunClock(lastAt))}</span>
                 <span>总耗时 ${lastMs != null ? `${lastMs}ms` : "—"}</span>
               </div>
-              <button type="button" class="msg-add-link pg-dock-add" id="pg-add-msg">+ 添加消息</button>
+              <button type="button" class="msg-add-link pg-dock-add ${state.msgView === "editor" ? "" : "hidden"}" id="pg-add-msg" title="在编辑器中添加一条消息">+ 添加消息</button>
             </div>
           </div>
 
@@ -2712,8 +3441,9 @@
               <div class="pg-out-actions">
                 <button type="button" class="btn btn-secondary btn-sm pg-insert-lib-btn" id="pg-insert-lib" title="将本轮抽取结果整批插入当前智能体的调试记忆库，供记忆检索调试召回">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-                  插入智能体库
+                  插入记忆库
                 </button>
+                <span id="pg-extract-lib-status" class="mem-lib-status is-pending-lib hidden" title="本会话抽取结果尚未插入调试记忆库">未插入记忆库</span>
                 <button type="button" class="pg-out-clear-btn ${outView === "graph" ? "" : "hidden"}" id="pg-graph-fs-btn" title="全屏查看图谱">
                   <span class="pg-fs-ico" aria-hidden="true">⛶</span> 全屏
                 </button>
@@ -2825,7 +3555,7 @@
                     <h3>检索结果</h3>
                     <div class="rv-card-hd-right">
                       <span class="um-card-sub" id="rv-result-meta">等待检索</span>
-                      <button type="button" class="btn btn-secondary btn-sm rv-chain-btn" id="rv-chain-btn" title="查看本次检索的召回链路（问题改写 / 多路召回 / 重排）">
+                      <button type="button" class="btn btn-secondary btn-sm rv-chain-btn" id="rv-chain-btn" title="查看本次检索的召回链路（多路召回 / 重排）">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h6M4 12h10M4 18h7"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/></svg>
                         召回链路
                       </button>
@@ -3141,7 +3871,6 @@
     const short = shortMemType(type);
     const roundLabel = m.roundLabel || "";
     const sourceIndexes = Array.isArray(m.sourceIndexes) ? m.sourceIndexes : [];
-    const inLib = debugLibraryHas(m.content);
     return `
       <div class="mem-result ${memTypeClass(type)}" data-mem-id="${esc(m.id || "")}"
         data-source-msgs="${esc(sourceIndexes.join(","))}" data-mem-type="${esc(type)}"
@@ -3152,11 +3881,10 @@
               ${roundLabel ? `<span class="mem-round-badge">${esc(roundLabel)}</span>` : ""}
               <span class="mem-type-tag ${memTypeClass(type)}">${esc(short)}</span>
             </span>
-            <button type="button" class="mem-lib-insert ${inLib ? "is-in-lib" : ""}"
-              data-mem-insert="${esc(m.content)}" data-mem-type="${esc(type)}"
-              title="${inLib ? "该记忆已在当前智能体调试库中" : "将该条抽取记忆插入当前智能体的调试记忆库，供记忆检索调试使用"}">
-              ${inLib ? "已在智能体库" : "插入至智能体库"}
-            </button>
+            <span class="mem-head-actions">
+              <button type="button" class="mem-src-view" data-mem-source
+                title="查看该条记忆对应的来源对话">查看记忆来源</button>
+            </span>
           </div>
           <p class="mem-text">${esc(m.content)}</p>
           <div class="mem-foot">
@@ -3174,7 +3902,7 @@
         content: m.content,
         type: m.type,
         extractAt: m.createdAt,
-        sessionLabel: "智能体库",
+        sessionLabel: "记忆库",
         roundLabel: memoryRoundLabel(msgs, m),
         sourceItem: memorySourceItem(msgs, m),
       }));
@@ -3309,18 +4037,6 @@
     const rewrite = rewriteRecallQuery(query, session, cfg.rewritePrompt);
     const stages = [];
     let totalMs = 0;
-
-    const rewriteMs = 28 + (rewrite.rewritten.length % 20);
-    totalMs += rewriteMs;
-    stages.push({
-      id: "rewrite",
-      title: "问题改写",
-      status: "ok",
-      ms: rewriteMs,
-      summary: rewrite.note,
-      rewritten: rewrite.rewritten,
-      original: query,
-    });
 
     let keywordHits = [];
     if (kwOn) {
@@ -3514,8 +4230,10 @@
     const channels = (mem.channels || (mem.channel ? [mem.channel] : []))
       .map((c) => (c === "keyword" ? "关键词" : c === "vector" ? "向量" : c))
       .filter(Boolean);
+    const memKey = esc(mem.id || mem.content || String(index));
     return `
-      <article class="rc-final">
+      <article class="rc-final" role="button" tabindex="0" data-rc-detail="${memKey}"
+        title="查看记忆详情">
         <div class="rc-final-hd">
           <span class="rc-final-rank">#${index + 1}</span>
           <div class="mem-head-row">
@@ -3528,6 +4246,60 @@
         <p class="mem-text">${esc(mem.content || "")}</p>
         <div class="rc-hit-src">来源对话：${esc(mem.sourceText || memorySourceItem([], mem))}</div>
       </article>`;
+  }
+
+  /** 调试记忆库 / 检索结果：打开记忆详情弹窗（与右侧「详情」一致） */
+  function openDebugMemoryDetail(mem) {
+    if (!mem) return;
+    const content = String(mem.content || "").trim();
+    const libHit =
+      (mem.id && ensureDebugLibrary().find((m) => m.id === mem.id)) ||
+      (content && ensureDebugLibrary().find((m) => String(m.content || "").trim() === content)) ||
+      null;
+    const view = libHit || mem;
+    openRecordModal(
+      "记忆详情",
+      `<div class="pg-log-param-card">
+        <div class="pg-log-param-name">${esc(view.type || "—")}</div>
+        <dl class="pg-log-param-dl">
+          <div><dt>记忆原文</dt><dd>${esc(view.content || "—")}</dd></div>
+          <div><dt>记忆标签</dt><dd>${esc((view.labels || []).join(" / ") || "—")}</dd></div>
+          <div><dt>来源</dt><dd>${esc(view.agent || view.sessionLabel || "—")}</dd></div>
+          <div><dt>创建时间</dt><dd>${esc(fmtMemTime(view.createdAt || view.extractAt) || "—")}</dd></div>
+          <div><dt>更新时间</dt><dd>${esc(fmtMemTime(view.updatedAt || view.createdAt || view.extractAt) || "—")}</dd></div>
+          ${mem.score != null || view.score != null ? `<div><dt>检索得分</dt><dd>${Number(mem.score ?? view.score).toFixed(2)}</dd></div>` : ""}
+        </dl>
+      </div>`
+    );
+  }
+
+  function resolveRecallMemory(key, mems) {
+    const list = Array.isArray(mems) ? mems : [];
+    const byId = list.find((m) => m.id && m.id === key);
+    if (byId) return byId;
+    const byContent = list.find((m) => String(m.content || "") === key);
+    if (byContent) return byContent;
+    return ensureDebugLibrary().find((m) => m.id === key || String(m.content || "") === key) || null;
+  }
+
+  function bindRecallFinalCards(root, mems) {
+    const scope = root || document;
+    $$("[data-rc-detail]", scope).forEach((card) => {
+      const open = () => {
+        const mem = resolveRecallMemory(card.dataset.rcDetail, mems);
+        if (!mem) {
+          toast("未找到该条记忆详情");
+          return;
+        }
+        openDebugMemoryDetail(mem);
+      };
+      card.addEventListener("click", open);
+      card.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        open();
+      });
+    });
   }
 
   /** 召回链路（各阶段命中明细）弹框 */
@@ -3543,7 +4315,8 @@
       return;
     }
     const pipe = latest.pipeline;
-    const stages = pipe.stages || [];
+    // 兼容历史链路数据：不再展示「问题改写」阶段
+    const stages = (pipe.stages || []).filter((s) => s.id !== "rewrite");
     openRecordModal(
       "召回链路",
       `<div class="rc-chain-modal">
@@ -3565,13 +4338,7 @@
           ? String(index + 1)
           : "✓";
     let body = "";
-    if (stage.id === "rewrite") {
-      body = `
-        <div class="rc-stage-block">
-          <div class="rc-kv"><span>原始问题</span><p>${esc(stage.original || "—")}</p></div>
-          <div class="rc-kv"><span>改写后</span><p class="rc-rewrite">${esc(stage.rewritten || "—")}</p></div>
-        </div>`;
-    } else if (stage.hits) {
+    if (stage.hits) {
       body = stage.hits.length
         ? `<div class="rc-hit-list">${stage.hits.map((h) => renderRecallHitCard(h, stage.id)).join("")}</div>`
         : `<div class="out-empty">本路未召回记忆</div>`;
@@ -3605,6 +4372,7 @@
       ? `<div class="rc-final-list">${mems.map((m, i) => renderRecallFinalCard(m, i)).join("")}</div>`
       : `<div class="out-empty">本轮未召回记忆，可尝试放宽相似度阈值或补充记忆库</div>`;
     updateRetrieveResultMeta(latest);
+    if (mems.length) bindRecallFinalCards(out, mems);
   }
 
   function updateRetrieveResultMeta(turn) {
@@ -3652,6 +4420,63 @@
     return ensureDebugLibrary().some((m) => String(m.content || "").trim() === key);
   }
 
+  function clearExtractInserted() {
+    state.pgExtractInserted = {};
+    const sess = currentSession();
+    if (sess) sess.extractInserted = false;
+    // 重跑时同步清空各抽取会话的入库标记
+    (ensurePgSessions()?.extract || []).forEach((env) => {
+      (env.chats || []).forEach((c) => {
+        c.extractInserted = false;
+      });
+      if ("extractInserted" in env) env.extractInserted = false;
+    });
+  }
+
+  function markExtractInserted(content) {
+    const key = String(content || "").trim();
+    if (!key) return;
+    if (!state.pgExtractInserted) state.pgExtractInserted = {};
+    state.pgExtractInserted[key] = true;
+  }
+
+  function isExtractInserted(content) {
+    const key = String(content || "").trim();
+    return !!(key && state.pgExtractInserted?.[key]);
+  }
+
+  /** 当前会话抽取结果是否已点过「插入记忆库」（默认 false，不看演示库预置数据） */
+  function isSessionExtractInLib() {
+    return !!currentSession()?.extractInserted;
+  }
+
+  function markSessionExtractInserted() {
+    const sess = currentSession();
+    if (sess) sess.extractInserted = true;
+  }
+
+  /** 同步调试结果右上角「已入/未插入记忆库」状态（插入记忆库按钮右侧） */
+  function syncExtractLibStatus(mems) {
+    const el = $("#pg-extract-lib-status");
+    if (!el) return;
+    const list = Array.isArray(mems) ? mems : [];
+    const show = state.debugMode !== "generate" && list.length > 0;
+    el.classList.toggle("hidden", !show);
+    if (!show) return;
+    const inLib = isSessionExtractInLib();
+    el.classList.toggle("is-in-lib", inLib);
+    el.classList.toggle("is-pending-lib", !inLib);
+    el.textContent = inLib ? "已入记忆库" : "未插入记忆库";
+    el.title = inLib ? "本会话抽取结果已插入调试记忆库" : "本会话抽取结果尚未插入调试记忆库";
+    const insertBtn = $("#pg-insert-lib");
+    if (insertBtn) {
+      insertBtn.disabled = inLib;
+      insertBtn.title = inLib
+        ? "本会话抽取结果已插入调试记忆库"
+        : "将本轮抽取结果整批插入当前智能体的调试记忆库，供记忆检索调试召回";
+    }
+  }
+
   /** 将一条记忆插入当前调试环境的记忆库（抽取结果 / 检索结果都可调用） */
   function insertMemoryToDebugLibrary(mem, sourceLabel, { silent = false } = {}) {
     const lib = ensureDebugLibrary();
@@ -3662,7 +4487,7 @@
       return false;
     }
     if (lib.some((m) => String(m.content || "").trim() === content)) {
-      if (!silent) toast("该记忆已在当前智能体库中");
+      if (!silent) toast("该记忆已在当前记忆库中");
       return false;
     }
     const now = new Date().toISOString();
@@ -3679,12 +4504,113 @@
     state.pgLibPage = 1;
     if (state.debugMode === "generate") renderDebugLibrary();
     refreshDebugLogModule();
-    if (!silent) toast(`已插入至智能体库「${debugLibraryEnvName()}」`);
+    if (!silent) toast(`已插入至记忆库「${debugLibraryEnvName()}」`);
     return true;
   }
 
-  /** 调试结果卡片右上角「插入调试记忆库」：把本轮抽取结果整批写入当前调试环境库 */
-  function insertAllExtractMemoriesToLib(space) {
+  /** 将抽取记忆写入当前用户 × 智能体的知识图谱（演示：新增实体节点与关联边） */
+  function insertMemoriesIntoKnowledgeGraph(mems, space) {
+    const uid = playgroundUserId();
+    const spaceId = space?.id || state.spaceId;
+    if (!uid || !spaceId || !mems?.length) return 0;
+    const key = graphKey(uid, spaceId);
+    let raw = MEMORA_DATA.graphs[key];
+    if (!raw || !Array.isArray(raw.nodes)) {
+      // 无真实图谱时以演示图谱为底，再叠加本次抽取节点
+      raw = demoGraphForUser(uid, spaceId);
+      MEMORA_DATA.graphs[key] = raw;
+    }
+    if (!Array.isArray(raw.edges)) raw.edges = [];
+    const userNodeId = `g-user-${uid}`;
+    if (!raw.nodes.some((n) => n.id === userNodeId || n.kind === "user")) {
+      const user = userById(uid);
+      raw.nodes.unshift({ id: userNodeId, label: user?.name || "用户", type: "用户", kind: "user" });
+    }
+    const hubId = raw.nodes.find((n) => n.kind === "user")?.id || userNodeId;
+    let added = 0;
+    mems.forEach((m, i) => {
+      const content = String(m.content || "").trim();
+      if (!content) return;
+      const exists = raw.nodes.some((n) => String(n.label || "").trim() === content || String(n.memContent || "").trim() === content);
+      if (exists) return;
+      const nid = `g-ins-${uid}-${Date.now().toString(36)}-${i}`;
+      const short = content.length > 18 ? `${content.slice(0, 18)}…` : content;
+      const gType = MEM_TYPE_GRAPH_CAT[m.type] || LEGACY_TYPE_MAP[m.type] || m.type || "其他";
+      raw.nodes.push({
+        id: nid,
+        label: short,
+        memContent: content,
+        type: gType,
+        kind: "memory",
+        agent: space?.name || umAgentFor(nid),
+      });
+      raw.edges.push({
+        id: `ge-ins-${uid}-${Date.now().toString(36)}-${i}`,
+        from: hubId,
+        to: nid,
+        label: m.type || "记忆",
+      });
+      added += 1;
+    });
+    if (added && state.graphInstance) {
+      state.graphInstance.setData(getGraph(uid, spaceId));
+    }
+    return added;
+  }
+
+  /** 点击「插入记忆库」：弹窗确认，并可选择是否同步写入知识图谱 */
+  function openInsertLibModal(space) {
+    const current = currentSession();
+    let mems = sessionMemories(current);
+    if (current?.memories == null) mems = defaultExtractMemories();
+    if (!mems.length) {
+      toast("当前没有可插入的抽取结果");
+      return;
+    }
+    const host = $("#modal-host");
+    if (!host) return;
+    const count = mems.length;
+    const envName = debugLibraryEnvName();
+    host.innerHTML = `
+      <div class="modal-backdrop" id="insert-lib-modal">
+        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="insert-lib-title">
+          <div class="modal-hd">
+            <h3 id="insert-lib-title">插入记忆库</h3>
+            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-bd">
+            <p class="modal-desc">将本轮 <b>${count}</b> 条抽取结果插入调试记忆库「${esc(envName)}」，供记忆检索调试召回。</p>
+            <label class="insert-lib-opt">
+              <input type="checkbox" id="insert-lib-kg" checked />
+              <span>
+                <strong>同时插入知识图谱</strong>
+                <em>把抽取实体写入当前用户的记忆关系图谱</em>
+              </span>
+            </label>
+          </div>
+          <div class="modal-ft">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="button" class="btn btn-primary" id="modal-confirm">确认插入</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => {
+      host.innerHTML = "";
+    };
+    $("#modal-x", host).onclick = close;
+    $("#modal-cancel", host).onclick = close;
+    $("#insert-lib-modal", host).addEventListener("click", (e) => {
+      if (e.target.id === "insert-lib-modal") close();
+    });
+    $("#modal-confirm", host).onclick = () => {
+      const intoGraph = !!$("#insert-lib-kg", host)?.checked;
+      close();
+      insertAllExtractMemoriesToLib(space, { intoGraph });
+    };
+  }
+
+  /** 调试结果「插入记忆库」：整批写入调试环境库，可选同步知识图谱 */
+  function insertAllExtractMemoriesToLib(space, { intoGraph = false } = {}) {
     const current = currentSession();
     const msgs = current?.messages || [];
     let mems = sessionMemories(current);
@@ -3698,16 +4624,27 @@
     let dup = 0;
     mems.forEach((m) => {
       const ok = insertMemoryToDebugLibrary({ content: m.content, type: m.type }, "抽取调试插入", { silent: true });
+      markExtractInserted(m.content);
       if (ok) added += 1;
       else dup += 1;
     });
-    if (!added) {
-      toast(`抽取结果均已存在于智能体库「${debugLibraryEnvName()}」`);
-      return;
+    markSessionExtractInserted();
+    let graphAdded = 0;
+    if (intoGraph) {
+      graphAdded = insertMemoriesIntoKnowledgeGraph(mems, space || spaceById(state.spaceId));
     }
     renderOutputPanel(space || spaceById(state.spaceId));
+    const graphTip = intoGraph
+      ? graphAdded
+        ? `，并写入知识图谱 ${graphAdded} 个实体`
+        : "，知识图谱无新增实体"
+      : "";
+    if (!added) {
+      toast(`抽取结果均已存在于记忆库「${debugLibraryEnvName()}」${graphTip}`);
+      return;
+    }
     toast(
-      `已插入 ${added} 条至智能体库「${debugLibraryEnvName()}」${dup ? `，${dup} 条已存在` : ""}`
+      `已插入 ${added} 条至记忆库「${debugLibraryEnvName()}」${dup ? `，${dup} 条已存在` : ""}${graphTip}`
     );
   }
 
@@ -3747,24 +4684,11 @@
     openRecordModal(`记忆来源 · ${type}`, body, null, "modal-lg");
   }
 
-  /** 抽取结果卡片：插入调试库 + 点击查看来源 */
+  /** 抽取结果卡片：点击/按钮查看来源 */
   function bindMemoryCardInserts(root, mems, msgs) {
     const scope = root || document;
     const list = Array.isArray(mems) ? mems : null;
     const chatMsgs = Array.isArray(msgs) ? msgs : currentSession()?.messages || [];
-    $$("[data-mem-insert]", scope).forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const ok = insertMemoryToDebugLibrary(
-          { content: btn.dataset.memInsert, type: btn.dataset.memType },
-          "抽取调试插入"
-        );
-        if (!ok) return;
-        btn.classList.add("is-in-lib");
-        btn.textContent = "已在智能体库";
-        btn.title = "该记忆已在当前智能体库中";
-      });
-    });
     $$(".mem-result", scope).forEach((card, i) => {
       const open = () => {
         const mem =
@@ -3774,13 +4698,17 @@
         if (!mem) return;
         openMemorySourceModal(mem, chatMsgs);
       };
+      card.querySelector("[data-mem-source]")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        open();
+      });
       card.addEventListener("click", (e) => {
-        if (e.target.closest("[data-mem-insert], button, a, input, select, textarea")) return;
+        if (e.target.closest("[data-mem-source], button, a, input, select, textarea")) return;
         open();
       });
       card.addEventListener("keydown", (e) => {
         if (e.key !== "Enter" && e.key !== " ") return;
-        if (e.target.closest("[data-mem-insert], button, a, input, select, textarea")) return;
+        if (e.target.closest("[data-mem-source], button, a, input, select, textarea")) return;
         e.preventDefault();
         open();
       });
@@ -3858,7 +4786,7 @@
                         <td class="um-mem-time">${esc(fmtMemTime(r.updatedAt))}</td>
                         <td class="um-td-action">
                           <button type="button" class="mon-link-btn" data-dl-detail="${esc(r.id)}">详情</button>
-                          <button type="button" class="um-icon-btn um-danger" data-dl-del="${esc(r.id)}" title="从智能体库移除" aria-label="移除">🗑</button>
+                          <button type="button" class="um-icon-btn um-danger" data-dl-del="${esc(r.id)}" title="从记忆库移除" aria-label="移除">🗑</button>
                         </td>
                       </tr>`
                     )
@@ -3870,7 +4798,7 @@
           : `<div class="um-filter-empty">${
               all.length
                 ? "当前筛选条件下暂无记忆"
-                : "当前智能体调试记忆库为空，可在左侧检索结果中点击「插入至智能体库」添加"
+                : "当前智能体调试记忆库为空，可在左侧检索结果中点击「插入至记忆库」添加"
             }</div>`
       }`;
     bindDebugLibrary(panel);
@@ -3913,20 +4841,7 @@
         const id = btn.dataset.dlDetail;
         const mem = ensureDebugLibrary().find((m) => m.id === id);
         if (!mem) return;
-        openRecordModal(
-          "记忆详情",
-          `<div class="pg-log-param-card">
-            <div class="pg-log-param-name">${esc(mem.type || "—")}</div>
-            <dl class="pg-log-param-dl">
-              <div><dt>记忆原文</dt><dd>${esc(mem.content)}</dd></div>
-              <div><dt>记忆标签</dt><dd>${esc((mem.labels || []).join(" / ") || "—")}</dd></div>
-              <div><dt>来源</dt><dd>${esc(mem.agent || "—")}</dd></div>
-              <div><dt>创建时间</dt><dd>${esc(fmtMemTime(mem.createdAt))}</dd></div>
-              <div><dt>更新时间</dt><dd>${esc(fmtMemTime(mem.updatedAt))}</dd></div>
-              ${mem.score != null ? `<div><dt>检索得分</dt><dd>${Number(mem.score).toFixed(2)}</dd></div>` : ""}
-            </dl>
-          </div>`
-        );
+        openDebugMemoryDetail(mem);
       });
     });
     $$("[data-dl-del]", panel).forEach((btn) => {
@@ -4381,6 +5296,7 @@
     const out = $("#pg-output");
     if (!out) return;
     if (state.debugMode === "generate") {
+      syncExtractLibStatus([]);
       renderRecallPanel(space);
       return;
     }
@@ -4415,7 +5331,8 @@
           }
         </div>
       </section>`;
-    // 抽取结果卡片：插入调试库 + 点击查看来源消息
+    syncExtractLibStatus(currentMems);
+    // 抽取结果卡片：点击查看来源消息
     bindMemoryCardInserts(out, currentMems, msgs);
   }
 
@@ -4582,12 +5499,15 @@
     );
     const isJson = view === "json";
     const isFile = view === "file";
+    const isEditor = view === "editor";
     $("#chat-stream")?.classList.toggle("hidden", isJson || isFile);
     $("#chat-json")?.classList.toggle("hidden", !isJson);
     $("#pg-file-import")?.classList.toggle("hidden", !isFile);
     $("#pg-debug-dock")?.classList.toggle("hidden", isFile);
+    // 「添加消息」仅 Editor 可见（JSON / 文件导入不显示）
+    $("#pg-add-msg")?.classList.toggle("hidden", !isEditor);
     if (isJson) refreshMsgJson();
-    if (!isFile && !isJson) replayDebug($("#chat-stream"));
+    if (isEditor) replayDebug($("#chat-stream"));
   }
 
   function refreshFileImportPanel() {
@@ -4640,6 +5560,73 @@
     }
   }
 
+  function sessionNameFromImportFile(filename) {
+    const raw = String(filename || "").trim() || "导入会话";
+    // 与文件名同名（保留扩展名，去掉路径）
+    const base = raw.split(/[/\\]/).pop() || raw;
+    return base.slice(0, 40);
+  }
+
+  /** 解析成功后：按文件名新建会话、写入消息、切到 Editor */
+  function loadImportAsNewSession() {
+    const files = ensureImportFiles();
+    const stats = importFilesStats();
+    if (!stats.fileCount) {
+      toast("请先上传文件");
+      return;
+    }
+    const env = currentAgentEnv();
+    if (!env) {
+      toast("请先选择智能体");
+      return;
+    }
+    ensureAgentChats(env);
+    const primaryName = sessionNameFromImportFile(files[0]?.name);
+    const chat = blankChat(currentModeKey(), primaryName);
+    const script = MEMORA_DATA.debugScripts?.extract || [];
+    if (script.length) chat.messages = cloneMessages(script);
+    else {
+      chat.messages = [
+        {
+          role: "user",
+          text: `（已从文件「${primaryName}」导入 ${stats.dialogs} 个对话 / ${stats.messages} 条消息）`,
+          at: new Date().toISOString(),
+        },
+      ];
+    }
+    chat.memories = currentModeKey() === "extract" ? [] : null;
+    chat._seedMemories = currentModeKey() === "extract" ? [] : null;
+    chat.importFrom = files.map((f) => f.name);
+    env.chats.unshift(chat);
+    env.chatIdx = 0;
+    ensureAgentChats(env);
+    state.msgView = "editor";
+    state.outCurrentOpen = true;
+    state.debugParamViewId = null;
+    state.debugLogPage = 0;
+    state.recallTurns = null;
+    toast(`解析成功，已创建会话「${primaryName}」并切换到 Editor`);
+    renderPage();
+  }
+
+  function setImportLoadBusy(busy) {
+    const panel = $("#pg-file-import");
+    const btn = $("#fi-load-btn", panel);
+    const statsEl = panel?.querySelector(".fi-foot-stats span:last-child");
+    if (btn) {
+      btn.disabled = !!busy;
+      btn.innerHTML = busy
+        ? `<span class="fi-load-spin" aria-hidden="true"></span>解析中…`
+        : `解析并加载 <span aria-hidden="true">›</span>`;
+    }
+    if (statsEl && busy) {
+      statsEl.textContent = "解析中，请稍候…";
+    } else if (statsEl && !busy) {
+      const stats = importFilesStats();
+      statsEl.textContent = `已解析 ${stats.fileCount} 个文件 · ${stats.dialogs} 个对话 · ${stats.messages} 条消息`;
+    }
+  }
+
   function bindFileImport() {
     const panel = $("#pg-file-import");
     if (!panel || panel.dataset.bound === "1") return;
@@ -4679,20 +5666,20 @@
     $("#fi-load-btn", panel)?.addEventListener("click", () => {
       const stats = importFilesStats();
       if (!stats.fileCount) {
-        toast("请先上传并解析文件");
+        toast("请先上传文件");
         return;
       }
-      const session = currentSession();
-      if (session) {
-        // 演示：用内置抽取脚本加载到当前环境对话
-        const script = MEMORA_DATA.debugScripts?.extract || [];
-        if (script.length) session.messages = cloneMessages(script);
-        session.memories = null;
-      }
-      toast(`已加载 ${stats.fileCount} 个文件（${stats.dialogs} 对话 / ${stats.messages} 消息）`);
-      applyMsgView("editor");
-      replayDebug($("#chat-stream"));
-      renderOutputPanel(spaceById(state.spaceId));
+      if (state._importLoading) return;
+      state._importLoading = true;
+      setImportLoadBusy(true);
+      // 解析中 → 解析成功 → 自动创建新会话 → 切换 Editor（会话名=文件名）
+      window.setTimeout(() => {
+        try {
+          loadImportAsNewSession();
+        } finally {
+          state._importLoading = false;
+        }
+      }, 700);
     });
   }
 
@@ -4755,8 +5742,9 @@
     const sess = currentSession();
     if (!sess) return;
     refreshEnvPicker();
+    refreshChatPicker();
     const nameEl = $("#pg-chat-session-name");
-    if (!nameEl) return;
+    if (nameEl) nameEl.textContent = chatListName(sess, currentAgentEnv()?.chatIdx || 0);
     const meta = document.querySelector(".pg-chat-session-meta");
     if (meta) {
       const space = spaceById(state.spaceId);
@@ -4777,6 +5765,347 @@
     }
   }
 
+  function renderChatPickerHtml() {
+    const env = currentAgentEnv();
+    const chats = agentChatList(env);
+    const cur = Math.min(Math.max(0, env?.chatIdx || 0), Math.max(0, chats.length - 1));
+    const curName = chatListName(chats[cur], cur);
+    const items = chats
+      .map((c, i) => {
+        const name = chatListName(c, i);
+        return `
+        <div class="pg-env-dd-item ${i === cur ? "is-active" : ""}" data-chat-idx="${i}" role="option" aria-selected="${i === cur}">
+          <button type="button" class="pg-env-dd-name" data-chat-pick="${i}">${esc(name)}</button>
+          <button type="button" class="pg-env-dd-more" data-chat-more="${i}" aria-label="更多操作" title="更多">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
+          </button>
+        </div>`;
+      })
+      .join("");
+    return `
+      <div class="pg-chat-pick" id="pg-chat-picker">
+        <span class="pg-chat-pick-label">会话</span>
+        <div class="pg-env-dd pg-chat-dd">
+          <button type="button" class="pg-env-dd-trigger" id="pg-chat-trigger" aria-haspopup="listbox" aria-expanded="false" title="切换会话">
+            <span class="pg-env-dd-label" id="pg-chat-label">${esc(curName)}</span>
+            <svg class="pg-env-dd-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <div class="pg-env-dd-panel hidden" id="pg-chat-panel" role="listbox" aria-label="会话列表">
+            ${items}
+          </div>
+          <div class="pg-env-dd-menu hidden" id="pg-chat-menu" role="menu">
+            <button type="button" role="menuitem" data-chat-act="rename">重命名</button>
+            <button type="button" role="menuitem" data-chat-act="delete" class="is-danger">删除</button>
+          </div>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm pg-chat-new" id="pg-chat-new" title="新建会话">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          新建
+        </button>
+      </div>`;
+  }
+
+  function refreshChatPicker() {
+    const picker = $("#pg-chat-picker");
+    if (!picker) return;
+    const wrap = document.createElement("div");
+    wrap.innerHTML = renderChatPickerHtml().trim();
+    const next = wrap.firstElementChild;
+    if (!next) return;
+    picker.replaceWith(next);
+    bindChatPicker();
+  }
+
+  function closeChatPicker() {
+    $("#pg-chat-panel")?.classList.add("hidden");
+    $("#pg-chat-menu")?.classList.add("hidden");
+    const trigger = $("#pg-chat-trigger");
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+    delete state._chatMenuIdx;
+  }
+
+  function openChatMoreMenu(idx, anchorBtn) {
+    const menu = $("#pg-chat-menu");
+    const panel = $("#pg-chat-panel");
+    const dd = document.querySelector(".pg-chat-dd");
+    if (!menu || !dd || !anchorBtn) return;
+    state._chatMenuIdx = idx;
+    panel?.classList.remove("hidden");
+    menu.classList.remove("hidden");
+    const ddRect = dd.getBoundingClientRect();
+    const btnRect = anchorBtn.getBoundingClientRect();
+    const panelRect = panel?.getBoundingClientRect() || ddRect;
+    const menuW = 120;
+    let left = panelRect.right - ddRect.left + 6;
+    let top = btnRect.top - ddRect.top;
+    if (ddRect.left + left + menuW > window.innerWidth - 8) {
+      left = Math.max(0, panelRect.left - ddRect.left - menuW - 6);
+    }
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+    $("#pg-chat-trigger")?.setAttribute("aria-expanded", "true");
+  }
+
+  function bindChatPicker() {
+    const picker = $("#pg-chat-picker");
+    if (!picker || picker.dataset.bound === "1") return;
+    picker.dataset.bound = "1";
+
+    $("#pg-chat-new", picker)?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeChatPicker();
+      openCreateChatModal();
+    });
+
+    $("#pg-chat-trigger", picker)?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const panel = $("#pg-chat-panel");
+      const menu = $("#pg-chat-menu");
+      const open = panel && !panel.classList.contains("hidden");
+      menu?.classList.add("hidden");
+      if (open) {
+        panel.classList.add("hidden");
+        e.currentTarget.setAttribute("aria-expanded", "false");
+      } else {
+        panel?.classList.remove("hidden");
+        e.currentTarget.setAttribute("aria-expanded", "true");
+      }
+    });
+
+    picker.addEventListener("click", (e) => {
+      const pick = e.target.closest("[data-chat-pick]");
+      if (pick) {
+        e.stopPropagation();
+        selectChat(Number(pick.dataset.chatPick));
+        return;
+      }
+      const more = e.target.closest("[data-chat-more]");
+      if (more) {
+        e.stopPropagation();
+        openChatMoreMenu(Number(more.dataset.chatMore), more);
+        return;
+      }
+      const act = e.target.closest("[data-chat-act]");
+      if (act) {
+        e.stopPropagation();
+        const action = act.dataset.chatAct;
+        const idx = state._chatMenuIdx;
+        closeChatPicker();
+        if (idx == null) return;
+        if (action === "rename") openRenameChatModal(idx);
+        else if (action === "delete") deleteChat(idx);
+      }
+    });
+
+    if (!document._chatPickerDocBound) {
+      document._chatPickerDocBound = true;
+      document.addEventListener("click", (e) => {
+        if (e.target.closest("#pg-chat-picker")) return;
+        closeChatPicker();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeChatPicker();
+      });
+    }
+  }
+
+  function selectChat(idx) {
+    const env = currentAgentEnv();
+    if (!env) return;
+    ensureAgentChats(env);
+    const next = Math.min(Math.max(0, Number(idx) || 0), env.chats.length - 1);
+    if (next === env.chatIdx) {
+      closeChatPicker();
+      return;
+    }
+    env.chatIdx = next;
+    ensureAgentChats(env);
+    state.outCurrentOpen = true;
+    state.recallTurns = null;
+    state.recallGraphHighlight = null;
+    state.debugParamViewId = null;
+    state.debugLogPage = 0;
+    state.comparePicking = false;
+    state.comparePickIds = [];
+    closeChatPicker();
+    renderPage();
+  }
+
+  function openCreateChatModal() {
+    const host = $("#modal-host");
+    if (!host) return;
+    host.innerHTML = `
+      <div class="modal-backdrop" id="chat-create-modal">
+        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="chat-create-title">
+          <div class="modal-hd">
+            <h3 id="chat-create-title">新建会话</h3>
+            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-bd">
+            <label class="field"><span>会话名称</span>
+              <input type="text" id="chat-name-input" class="input" placeholder="例如：巡演购票场景" maxlength="40" autocomplete="off" />
+            </label>
+          </div>
+          <div class="modal-ft">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="button" class="btn btn-primary" id="modal-confirm">创建</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => {
+      host.innerHTML = "";
+    };
+    $("#modal-x", host).onclick = close;
+    $("#modal-cancel", host).onclick = close;
+    $("#chat-create-modal", host).addEventListener("click", (e) => {
+      if (e.target.id === "chat-create-modal") close();
+    });
+    const input = $("#chat-name-input", host);
+    setTimeout(() => input?.focus(), 0);
+    const submit = () => {
+      const name = (input?.value || "").trim();
+      if (!name) {
+        toast("请输入会话名称");
+        input?.focus();
+        return;
+      }
+      close();
+      createChatWithName(name);
+    };
+    $("#modal-confirm", host).onclick = submit;
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+  }
+
+  function createChatWithName(name) {
+    const env = currentAgentEnv();
+    if (!env) return;
+    ensureAgentChats(env);
+    const chat = blankChat(currentModeKey(), name);
+    env.chats.unshift(chat);
+    env.chatIdx = 0;
+    ensureAgentChats(env);
+    state.outCurrentOpen = true;
+    state.debugParamViewId = null;
+    state.debugLogPage = 0;
+    toast(`已新建会话「${name}」`);
+    renderPage();
+  }
+
+  function openRenameChatModal(idx) {
+    const env = currentAgentEnv();
+    if (!env) return;
+    ensureAgentChats(env);
+    const chat = env.chats[idx];
+    if (!chat) return;
+    const host = $("#modal-host");
+    if (!host) return;
+    const curName = chatListName(chat, idx);
+    host.innerHTML = `
+      <div class="modal-backdrop" id="chat-rename-modal">
+        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="chat-rename-title">
+          <div class="modal-hd">
+            <h3 id="chat-rename-title">重命名会话</h3>
+            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-bd">
+            <label class="field"><span>会话名称</span>
+              <input type="text" id="chat-rename-input" class="input" maxlength="40" autocomplete="off" value="${esc(curName)}" />
+            </label>
+          </div>
+          <div class="modal-ft">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="button" class="btn btn-primary" id="modal-confirm">确认</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => {
+      host.innerHTML = "";
+    };
+    $("#modal-x", host).onclick = close;
+    $("#modal-cancel", host).onclick = close;
+    $("#chat-rename-modal", host).addEventListener("click", (e) => {
+      if (e.target.id === "chat-rename-modal") close();
+    });
+    const input = $("#chat-rename-input", host);
+    setTimeout(() => {
+      input?.focus();
+      input?.select();
+    }, 0);
+    const submit = () => {
+      const title = (input?.value || "").trim();
+      if (!title) {
+        toast("名称不能为空");
+        input?.focus();
+        return;
+      }
+      chat.title = title;
+      close();
+      refreshChatPicker();
+      toast("已重命名会话");
+    };
+    $("#modal-confirm", host).onclick = submit;
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
+  }
+
+  function deleteChat(idx) {
+    const env = currentAgentEnv();
+    if (!env) return;
+    ensureAgentChats(env);
+    if (env.chats.length <= 1) {
+      toast("至少保留一个会话");
+      return;
+    }
+    const chat = env.chats[idx];
+    if (!chat) return;
+    const host = $("#modal-host");
+    if (!host) return;
+    const label = chatListName(chat, idx);
+    host.innerHTML = `
+      <div class="modal-backdrop" id="chat-delete-modal">
+        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="chat-delete-title">
+          <div class="modal-hd">
+            <h3 id="chat-delete-title">删除会话？</h3>
+            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-bd">
+            <p class="modal-desc">确定删除「${esc(label)}」？删除后不可恢复。</p>
+          </div>
+          <div class="modal-ft">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="button" class="btn btn-danger" id="modal-confirm-delete">删除</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => {
+      host.innerHTML = "";
+    };
+    const doDelete = () => {
+      ensureAgentChats(env);
+      if (env.chats.length <= 1) {
+        toast("至少保留一个会话");
+        close();
+        return;
+      }
+      env.chats.splice(idx, 1);
+      if (env.chatIdx >= env.chats.length) env.chatIdx = env.chats.length - 1;
+      else if (env.chatIdx > idx) env.chatIdx -= 1;
+      ensureAgentChats(env);
+      close();
+      toast("已删除会话");
+      renderPage();
+    };
+    $("#modal-x", host).onclick = close;
+    $("#modal-cancel", host).onclick = close;
+    $("#modal-confirm-delete", host).onclick = doDelete;
+    $("#chat-delete-modal", host).addEventListener("click", (e) => {
+      if (e.target.id === "chat-delete-modal") close();
+    });
+  }
+
   function renderEnvPickerHtml() {
     const envList = debugEnvList();
     const cur = Math.min(Math.max(0, state.pgSessionIdx), Math.max(0, envList.length - 1));
@@ -4787,9 +6116,7 @@
         return `
         <div class="pg-env-dd-item ${i === cur ? "is-active" : ""}" data-env-idx="${i}" role="option" aria-selected="${i === cur}">
           <button type="button" class="pg-env-dd-name" data-env-pick="${i}">${esc(name)}</button>
-          <button type="button" class="pg-env-dd-more" data-env-more="${i}" aria-label="更多操作" title="更多">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
-          </button>
+          <button type="button" class="pg-env-dd-del" data-env-del="${i}" aria-label="删除智能体" title="删除">删除</button>
         </div>`;
       })
       .join("");
@@ -4803,10 +6130,6 @@
           </button>
           <div class="pg-env-dd-panel hidden" id="pg-env-panel" role="listbox" aria-label="智能体列表">
             ${items}
-          </div>
-          <div class="pg-env-dd-menu hidden" id="pg-env-menu" role="menu">
-            <button type="button" role="menuitem" data-env-act="rename">重命名</button>
-            <button type="button" role="menuitem" data-env-act="delete" class="is-danger">删除</button>
           </div>
         </div>
       </div>`;
@@ -4845,34 +6168,8 @@
 
   function closeEnvPicker() {
     $("#pg-env-panel")?.classList.add("hidden");
-    $("#pg-env-menu")?.classList.add("hidden");
     const trigger = $("#pg-env-trigger");
     if (trigger) trigger.setAttribute("aria-expanded", "false");
-    delete state._envMenuIdx;
-  }
-
-  function openEnvMoreMenu(idx, anchorBtn) {
-    const menu = $("#pg-env-menu");
-    const panel = $("#pg-env-panel");
-    const dd = document.querySelector(".pg-env-dd");
-    if (!menu || !dd || !anchorBtn) return;
-    state._envMenuIdx = idx;
-    panel?.classList.remove("hidden");
-    menu.classList.remove("hidden");
-    // 菜单放在环境列表右侧，避免挡住列表项
-    const ddRect = dd.getBoundingClientRect();
-    const btnRect = anchorBtn.getBoundingClientRect();
-    const panelRect = panel?.getBoundingClientRect() || ddRect;
-    const menuW = 120;
-    let left = panelRect.right - ddRect.left + 6;
-    let top = btnRect.top - ddRect.top;
-    // 视口右侧不够时改到列表左侧
-    if (ddRect.left + left + menuW > window.innerWidth - 8) {
-      left = Math.max(0, panelRect.left - ddRect.left - menuW - 6);
-    }
-    menu.style.left = `${Math.round(left)}px`;
-    menu.style.top = `${Math.round(top)}px`;
-    $("#pg-env-trigger")?.setAttribute("aria-expanded", "true");
   }
 
   function bindEnvPicker() {
@@ -4888,41 +6185,26 @@
         const open = panel && !panel.classList.contains("hidden");
         if (open) closeEnvPicker();
         else {
-          $("#pg-env-menu")?.classList.add("hidden");
           panel?.classList.remove("hidden");
           trigger.setAttribute("aria-expanded", "true");
         }
         return;
       }
-      const more = e.target.closest("[data-env-more]");
-      if (more) {
+      const del = e.target.closest("[data-env-del]");
+      if (del) {
         e.preventDefault();
         e.stopPropagation();
-        const idx = Number(more.dataset.envMore);
-        const menu = $("#pg-env-menu");
-        if (menu && !menu.classList.contains("hidden") && state._envMenuIdx === idx) {
-          menu.classList.add("hidden");
-          delete state._envMenuIdx;
-          return;
-        }
-        openEnvMoreMenu(idx, more);
+        const idx = Number(del.dataset.envDel);
+        closeEnvPicker();
+        const env = debugEnvList()[idx];
+        if (env?.spaceId) confirmDeleteAgentSpace(env.spaceId);
+        else confirmDeleteSession(idx, sessionListLabel(env, idx));
         return;
       }
       const pick = e.target.closest("[data-env-pick]");
       if (pick) {
         e.stopPropagation();
         activateDebugEnv(pick.dataset.envPick);
-        return;
-      }
-      const act = e.target.closest("[data-env-act]");
-      if (act) {
-        e.stopPropagation();
-        const idx = state._envMenuIdx;
-        const action = act.dataset.envAct;
-        closeEnvPicker();
-        if (idx == null) return;
-        if (action === "rename") openRenameEnvModal(idx);
-        else if (action === "delete") deleteSession(idx);
       }
     });
 
@@ -4936,71 +6218,6 @@
         if (e.key === "Escape") closeEnvPicker();
       });
     }
-  }
-
-  function openRenameEnvModal(idx) {
-    ensurePgSessions();
-    syncDebugEnvsWithAgents();
-    const bag = state.pgSessions;
-    const sess = bag[currentModeKey()][idx];
-    if (!sess) return;
-    const space = sess.spaceId ? spaceById(sess.spaceId) : null;
-    const host = $("#modal-host");
-    if (!host) return;
-    const curName = sessionListName(sess, idx);
-    host.innerHTML = `
-      <div class="modal-backdrop" id="env-rename-modal">
-        <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="env-rename-title">
-          <div class="modal-hd">
-            <h3 id="env-rename-title">重命名智能体</h3>
-            <button type="button" class="icon-btn" id="modal-x" aria-label="关闭">×</button>
-          </div>
-          <div class="modal-bd">
-            <label class="field"><span>智能体名称</span>
-              <input type="text" id="env-rename-input" class="input" maxlength="30" autocomplete="off" value="${esc(curName)}" />
-            </label>
-          </div>
-          <div class="modal-ft">
-            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
-            <button type="button" class="btn btn-primary" id="modal-confirm">确认</button>
-          </div>
-        </div>
-      </div>`;
-    const close = () => {
-      host.innerHTML = "";
-    };
-    $("#modal-x", host).onclick = close;
-    $("#modal-cancel", host).onclick = close;
-    $("#env-rename-modal", host).addEventListener("click", (e) => {
-      if (e.target.id === "env-rename-modal") close();
-    });
-    const input = $("#env-rename-input", host);
-    setTimeout(() => {
-      input?.focus();
-      input?.select();
-    }, 0);
-    const submit = () => {
-      const title = (input?.value || "").trim();
-      if (!title) {
-        toast("名称不能为空");
-        input?.focus();
-        return;
-      }
-      if (space) {
-        space.name = title;
-        space.updatedAt = new Date().toISOString();
-      }
-      if (bag.extract[idx]) bag.extract[idx].displayName = title;
-      if (bag.generate[idx]) bag.generate[idx].displayName = title;
-      close();
-      refreshSessionSelect();
-      refreshEnvPicker();
-      toast("已重命名智能体");
-    };
-    $("#modal-confirm", host).onclick = submit;
-    input?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") submit();
-    });
   }
 
   // 新建智能体：复用记忆空间新建表单；创建后自动对齐调试环境并激活
@@ -5129,12 +6346,13 @@
         : tab === "forget"
           ? renderForgetEngine(d.forget)
           : renderReflectEngine(d.reflect);
-      paneEl.innerHTML = isProdForm
-        ? `<div class="engine-prod-body">${pane}</div>`
-        : `<div class="engine-split">
+      paneEl.innerHTML =
+        tab === "forget"
+          ? `<div class="engine-split">
             <section class="engine-form">${pane}</section>
-            <aside class="engine-preview">${renderEnginePreview(tab, d)}</aside>
-          </div>`;
+            <aside class="engine-preview">${renderEnginePreview(tab, d, space)}</aside>
+          </div>`
+          : `<div class="engine-split is-solo"><section class="engine-form">${pane}</section></div>`;
 
       bindConfigForms(body, space, false);
       if (isProdForm) {
@@ -5143,8 +6361,10 @@
           if (e.target?.closest?.("#dbg-cfg-template")) return;
           persistProd();
         };
+        paneEl.oninput = null;
       } else {
         paneEl.onchange = null;
+        paneEl.oninput = null;
         paneEl.querySelectorAll("[data-eng]").forEach((el) => {
           const key = el.dataset.eng;
           const apply = () => {
@@ -5160,7 +6380,7 @@
             space.config[tab] = { ...cur };
             markCustom();
             const preview = body.querySelector(".engine-preview");
-            if (preview) preview.innerHTML = renderEnginePreview(tab, d);
+            if (preview) preview.innerHTML = renderEnginePreview(tab, d, space);
           };
           el.addEventListener("input", apply);
           el.addEventListener("change", apply);
@@ -5218,32 +6438,32 @@
   }
 
   function createSession() {
-    openAgentFormModal(null);
+    openCreateChatModal();
   }
 
   function renameSession(idx) {
-    openRenameEnvModal(idx);
+    openRenameChatModal(idx);
   }
 
   function duplicateSession(idx) {
-    toast("智能体与调试环境一一对应，请通过「新建智能体」创建");
+    const env = currentAgentEnv();
+    if (!env) return;
+    ensureAgentChats(env);
+    const src = env.chats[idx];
+    if (!src) return;
+    const copy = JSON.parse(JSON.stringify(src));
+    copy.id = `chat-${Date.now().toString(36)}`;
+    copy.title = `${chatListName(src, idx)}（副本）`;
+    copy.startedAt = new Date().toISOString();
+    env.chats.splice(idx + 1, 0, copy);
+    env.chatIdx = idx + 1;
+    ensureAgentChats(env);
+    toast("已复制会话");
+    renderPage();
   }
 
   function deleteSession(idx) {
-    ensurePgSessions();
-    syncDebugEnvsWithAgents();
-    const sessions = state.pgSessions[currentModeKey()];
-    if (sessions.length <= 1) {
-      toast("至少保留一个智能体");
-      return;
-    }
-    const sess = sessions[idx];
-    if (!sess) return;
-    if (sess.spaceId) {
-      confirmDeleteAgentSpace(sess.spaceId);
-      return;
-    }
-    confirmDeleteSession(idx, sessionListLabel(sess, idx));
+    deleteChat(idx);
   }
 
   function confirmDeleteSession(idx, label) {
@@ -5388,6 +6608,7 @@
     }
     const stream = $("#chat-stream");
     const uid = () => playgroundUserId();
+    bindChatPicker();
     replayDebug(stream);
     renderOutputPanel(space);
     updatePgActionLabel();
@@ -5552,8 +6773,8 @@
 
     $("#pg-run")?.addEventListener("click", () => runPlayground(space));
 
-    // 调试结果卡片右上角：整批插入调试记忆库
-    $("#pg-insert-lib")?.addEventListener("click", () => insertAllExtractMemoriesToLib(space));
+    // 调试结果右上角：弹窗确认后插入记忆库（可选知识图谱）
+    $("#pg-insert-lib")?.addEventListener("click", () => openInsertLibModal(space));
 
     $("#pg-add-msg")?.addEventListener("click", () => addDebugMessage(space));
 
@@ -5630,7 +6851,7 @@
     });
     $("#rv-run")?.addEventListener("click", () => runRetrieveDebug(space));
     $("#pg-retest")?.addEventListener("click", () => runRetrieveDebug(space));
-    // 召回链路：整条链路（问题改写 / 多路召回 / 重排）收进弹框，卡片内只留最终结果
+    // 召回链路：多路召回 / 重排收进弹框，卡片内只留最终结果
     $("#rv-chain-btn")?.addEventListener("click", () => openRecallChainModal());
     updateRetrieveResultMeta(
       [...(state.recallTurns || [])].reverse().find((t) => t.open) || (state.recallTurns || [])[0] || null
@@ -5997,6 +7218,7 @@
     setTimeout(() => {
       const sessions = ensurePgSessions()[currentModeKey()];
       sessions.forEach((sess) => regenerateSessionMemories(sess, space, isGen));
+      clearExtractInserted();
       clearParamsDirty();
       state._retestPending = false;
       setPgRunLoading(false);
@@ -6089,6 +7311,7 @@
           extractEveryN: Number(state.extractEveryN) || 1,
         });
       }
+      clearExtractInserted();
       state.outCurrentOpen = true;
       state.outView = "output";
       renderOutputPanel(space);
@@ -6411,6 +7634,9 @@
     };
     bindTaCount("#ex-prompt");
     bindTaCount("#ex-extract-rules");
+    bindTaCount("#ex-rules-user");
+    bindTaCount("#ex-rules-assistant");
+    bindTaCount("#ex-rules-exclude");
 
     $$("[data-ex-mod]", body).forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -6438,9 +7664,11 @@
 
     $("#ex-view-final-prompt", body)?.addEventListener("click", () => {
       // 用草稿编译，避免只读浏览时误写生产配置
-      const space = spaceById(state.spaceId) || accessibleSpaces()[0];
-      const draftCfg = { extract: cloneConfig(space?.config?.extract || { types: [], model: "mem-extract-v2" }) };
+      const ctx = getActiveExtractCfg(body);
+      const srcExtract = ctx?.extract || spaceById(state.spaceId)?.config?.extract || { types: [], model: "mem-extract-v2" };
+      const draftCfg = { extract: cloneConfig(srcExtract) };
       writeExtractToConfig(body, draftCfg);
+      ensureFewShotExamples(draftCfg.extract);
       const finalPrompt = compileExtractPrompt(draftCfg.extract);
       openRecordModal(
         "最终 Prompt",
@@ -6458,6 +7686,14 @@
         }
       });
     });
+
+    // 提取示例（Few-shot）：列表 / 添加 / 编辑 / 删除 / 排序
+    {
+      const ctx = getActiveExtractCfg(body);
+      if (ctx?.cfg && $("#ex-fewshot-section", body)) {
+        bindFewShotSection(body, ctx.cfg, locked);
+      }
+    }
     $("#rt-rewrite", body)?.addEventListener("input", (e) => {
       const count = e.target.closest(".textarea-wrap")?.querySelector(".field-count");
       if (count) count.textContent = `${e.target.value.length}/2000`;
@@ -7888,10 +9124,10 @@
       });
     });
 
-    // 用户端头部「→ 管理端」：仅管理员/超管预览时出现，切回管理端监控页
+    // 用户端头部「→ 管理端」：仅管理员/超管预览时出现，切回管理端记忆空间
     $("#user-view-back", root)?.addEventListener("click", () => {
       state.viewMode = "admin";
-      state.page = "monitor";
+      state.page = "memories";
       renderChrome();
       renderPage();
     });
@@ -8545,9 +9781,10 @@
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         closeAllAgentMenus();
-        // 跳转到「记忆参数配置」，并把当前智能体记忆空间设为配置对象
+        // 跳转到「记忆参数配置」，默认落在「萃取引擎」
         state.spaceId = btn.dataset.agentConfig;
         state.engineEditing = false;
+        state.engineTab = "extract";
         state.page = "engine";
         renderChrome();
         renderPage();
@@ -10472,9 +11709,7 @@
   }
 
   function closeDrawer() {
-    $("#detail-drawer").classList.add("hidden");
-    $("#drawer-backdrop").classList.add("hidden");
-    $("#detail-drawer").setAttribute("aria-hidden", "true");
+    closeAppDrawer();
   }
 
   function destroyGraph() {
@@ -10503,6 +11738,26 @@
   }
 
   /* ================= 操作日志（管理操作记录，不含登录日志） ================= */
+  /** 演示数据日期相对「今天」平移，避免默认「最近7天」筛空 */
+  function ensureAuditDemoFresh() {
+    if (MEMORA_DATA._auditSeedFresh) return;
+    MEMORA_DATA._auditSeedFresh = true;
+    const logs = MEMORA_DATA.auditLogs;
+    if (!Array.isArray(logs) || !logs.length) return;
+    const times = logs
+      .map((l) => new Date(l.at).getTime())
+      .filter((t) => Number.isFinite(t));
+    if (!times.length) return;
+    const maxT = Math.max(...times);
+    const targetMax = Date.now() - 2 * 3600 * 1000;
+    const delta = targetMax - maxT;
+    if (Math.abs(delta) < 12 * 3600 * 1000) return;
+    logs.forEach((l) => {
+      const t = new Date(l.at).getTime();
+      if (Number.isFinite(t)) l.at = new Date(t + delta).toISOString();
+    });
+  }
+
   const AUDIT_MODULE_META = {
     permissions: { label: "权限管理", actions: ["create", "update", "delete"] },
     space: { label: "记忆空间", actions: ["create", "update", "delete"] },
@@ -10580,6 +11835,7 @@
   }
 
   function filteredAuditLogs() {
+    ensureAuditDemoFresh();
     const f = state.auditFilter || {};
     const { from, to } = auditRangeBounds(f);
     return (MEMORA_DATA.auditLogs || [])
@@ -10773,8 +12029,23 @@
   }
 
   function renderAudit(root) {
+    ensureAuditDemoFresh();
     setPageTitle("");
     state.auditFilter = state.auditFilter || { range: "7d", customFrom: "", customTo: "", module: "", action: "" };
+    // 自定义区间无效（缺值或开始晚于结束）时回落到最近 7 天，避免首次进来为空
+    if (state.auditFilter.range === "custom") {
+      const from = state.auditFilter.customFrom ? new Date(state.auditFilter.customFrom) : null;
+      const to = state.auditFilter.customTo ? new Date(state.auditFilter.customTo) : null;
+      const invalid =
+        !from ||
+        !to ||
+        Number.isNaN(from.getTime()) ||
+        Number.isNaN(to.getTime()) ||
+        from > to;
+      if (invalid) {
+        state.auditFilter = { range: "7d", customFrom: "", customTo: "", module: state.auditFilter.module || "", action: state.auditFilter.action || "" };
+      }
+    }
     const f = state.auditFilter;
     const logs = filteredAuditLogs();
     const pg = paginateList(logs, state.auditPage || 1, 10);
@@ -11720,18 +12991,13 @@
         : ["检索引擎", "配置生产环境召回数量、相似度阈值与多路检索权重"];
     const body = tab === "extract" ? renderExtractForm(cfg, locked) : renderRetrieveForm(cfg, locked);
     return `
-      <div class="params-grid params-grid-single engine-prod-grid">
-        <section class="params-card">
-          <header class="params-card-hd params-card-hd-engine">
-            <div class="params-card-hd-text">
-              <h3>${meta[0]}</h3>
-              <p>${meta[1]}</p>
-            </div>
-            <span class="badge badge-green">生产生效中</span>
-          </header>
-          ${body}
-        </section>
-      </div>`;
+      <header class="engine-hd">
+        <div>
+          <h3>${meta[0]}</h3>
+          <p>${meta[1]}</p>
+        </div>
+      </header>
+      ${body}`;
   }
 
   function renderEngineParams(root) {
@@ -11791,17 +13057,17 @@
                 ${spaceOptions}
               </select>
             </label>
-            <button type="button" class="btn btn-secondary engine-act-btn" id="engine-reset" ${opsLocked ? "disabled" : ""}>
+            <button type="button" class="btn btn-secondary btn-sm engine-act-btn" id="engine-reset" ${opsLocked ? "disabled" : ""}>
               ${engineActionIcon("reset")}
               恢复默认
             </button>
             ${
               editing
-                ? `<button type="button" class="btn btn-primary engine-act-btn" id="engine-save">
+                ? `<button type="button" class="btn btn-primary btn-sm engine-act-btn" id="engine-save">
                     ${engineActionIcon("save")}
                     保存并应用
                   </button>`
-                : `<button type="button" class="btn btn-primary engine-act-btn" id="engine-edit" ${opsLocked ? "disabled" : ""}>
+                : `<button type="button" class="btn btn-primary btn-sm engine-act-btn" id="engine-edit" ${opsLocked ? "disabled" : ""}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
                     编辑
                   </button>`
@@ -11809,11 +13075,13 @@
           </div>
         </div>
         ${
-          isProdForm
-            ? `<div class="engine-prod-body">${opsLocked ? `<p class="badge badge-warn">当前账号仅可查看，无空间运维权限</p>` : ""}${pane}</div>`
-            : `<div class="engine-split">
-                <section class="engine-form">${pane}</section>
-                <aside class="engine-preview">${renderEnginePreview(tab, d)}</aside>
+          tab === "forget"
+            ? `<div class="engine-split">
+                <section class="engine-form ${paneLocked ? "is-locked" : ""}">${opsLocked ? `<p class="badge badge-warn">当前账号仅可查看，无空间运维权限</p>` : ""}${pane}</section>
+                <aside class="engine-preview">${renderEnginePreview(tab, d, space)}</aside>
+              </div>`
+            : `<div class="engine-split is-solo">
+                <section class="engine-form ${paneLocked ? "is-locked" : ""}">${opsLocked && (tab === "extract" || tab === "retrieve") ? `<p class="badge badge-warn">当前账号仅可查看，无空间运维权限</p>` : ""}${pane}</section>
               </div>`
         }
       </div>`;
@@ -11861,15 +13129,15 @@
           const lab = root.querySelector(`[data-eng-val="${key}"]`);
           if (lab) lab.textContent = formatEngVal(key, cur[key]);
           const preview = root.querySelector(".engine-preview");
-          if (preview) preview.innerHTML = renderEnginePreview(tab, d);
+          if (preview) preview.innerHTML = renderEnginePreview(tab, d, space);
         };
         el.addEventListener("input", apply);
         el.addEventListener("change", apply);
       });
     }
 
-    // 非编辑态：禁用当前 Tab 卡片内全部表单控件（遗忘/反思的 data-eng 控件及生产表单兜底）
-    const paneEl = isProdForm ? root.querySelector(".engine-prod-body") : root.querySelector(".engine-form");
+    // 非编辑态：禁用当前 Tab 卡片内全部表单控件
+    const paneEl = root.querySelector(".engine-form");
     if (paneEl) {
       paneEl.classList.toggle("is-locked", paneLocked);
       paneEl.querySelectorAll("input, select, textarea").forEach((el) => {
@@ -12185,7 +13453,7 @@
       </div>`;
   }
 
-  function renderEnginePreview(tab, d) {
+  function renderEnginePreview(tab, d, space, formRoot) {
     if (tab === "forget") {
       const f = d.forget;
       const g = forgetChartGeom();
@@ -12281,37 +13549,85 @@
         </div>`;
     }
     if (tab === "reflect") {
-      const r = d.reflect;
-      const periodFactor = { hourly: 1.8, "6h": 1.3, daily: 1, weekly: 0.55 }[r.period] || 1;
-      const scopeFactor = { recent: 1, incremental: 0.7, high: 0.85, all: 1.6 }[r.scope] || 1;
-      const modelFactor = r.model === "reflect-pro" ? 1.35 : 1;
-      const gateFactor = (r.qualityAssess ? 1.08 : 1) * (r.memoryAudit ? 1.06 : 1);
-      const compute = (18.6 * periodFactor * scopeFactor * modelFactor * gateFactor).toFixed(1);
-      const consume = (7.2 * periodFactor * scopeFactor * modelFactor).toFixed(1);
-      const computePct = Math.min(100, Math.round((Number(compute) / 40) * 100));
-      const consumePct = Math.min(100, Math.round((Number(consume) / 20) * 100));
+      return "";
+    }
+    const sp = space || spaceById(state.spaceId);
+    const cfg = sp?.config || {};
+    // formRoot 仅在挂载后刷新预览时传入，避免初次渲染读到旧 DOM
+    if (tab === "extract") {
+      ensureExtractModules(cfg);
+      const draftCfg = { extract: cloneConfig(cfg.extract || { types: [], model: "mem-extract-v2" }) };
+      if (formRoot) {
+        try {
+          writeExtractToConfig(formRoot, draftCfg);
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      let finalPrompt = "";
+      try {
+        finalPrompt = compileExtractPrompt(draftCfg.extract);
+      } catch (_) {
+        finalPrompt = "（配置不完整，暂无法预览）";
+      }
+      const lines = String(finalPrompt).split("\n").length;
+      const chars = String(finalPrompt).length;
       return `
-        <div class="engine-impact engine-impact-solo">
-          <h3>变更影响评估</h3>
-          <p class="fg-impact-note">${r.enabled ? "保存并下发后，将按周期生成结构化认知并写入长期记忆。" : "当前关闭，不会产生新的反思记忆。"}</p>
-          <ul class="fg-bars">
-            <li><div><span>影响主体</span><b>82</b></div><i style="width:42%"></i></li>
-            <li><div><span>涉及记忆</span><b>${r.scope === "all" ? "2.08M" : r.scope === "incremental" ? "0.68M" : "1.24M"}</b></div><i style="width:${r.scope === "all" ? 92 : r.scope === "incremental" ? 48 : 78}%"></i></li>
-            <li><div><span>预计算力</span><b>${r.enabled ? `${compute}k` : "0"}</b></div><i style="width:${r.enabled ? computePct : 4}%"></i></li>
-            <li><div><span>预计消耗</span><b>${r.enabled ? `${consume}k` : "0"}</b></div><i style="width:${r.enabled ? consumePct : 4}%"></i></li>
-          </ul>
-          <p>质量评估 ${r.qualityAssess ? "已开" : "已关"} · 记忆审核 ${r.memoryAudit ? "已开" : "已关"}。参数在下一次迭代周期生效。</p>
+        <div class="fg-preview pe-prompt-preview">
+          <header class="fg-preview-hd">
+            <div>
+              <h3>最终 Prompt 预览</h3>
+              <p>由左侧模块实时拼接 · ${chars} 字 · ${lines} 行</p>
+            </div>
+          </header>
+          <pre class="pe-final-prompt pe-final-prompt-live">${esc(finalPrompt)}</pre>
+          <div class="fg-metric-grid">
+            <div class="fg-metric"><span>模型</span><b>${esc(draftCfg.extract?.model || "—")}</b></div>
+            <div class="fg-metric"><span>字符数</span><b>${chars}</b></div>
+            <div class="fg-metric"><span>行数</span><b>${lines}</b></div>
+          </div>
         </div>`;
     }
-    const kw = 100 - Number(d.retrieve.vectorWeight);
+    // 检索引擎：与遗忘引擎同结构的右侧概览
+    const draftRetrieve = { retrieve: cloneConfig(cfg.retrieve || {}) };
+    if (formRoot) {
+      try {
+        writeRetrieveToConfig(formRoot, draftRetrieve);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    const r = ensureRetrieve(draftRetrieve);
+    const vecOn = methodOn(r, "vector");
+    const kwOn = methodOn(r, "keyword");
+    const vw = vecOn && kwOn ? Math.round(Number(r.vectorWeight) || 0) : vecOn ? 100 : 0;
+    const kw = 100 - vw;
+    const sim = Number(r.similarity ?? r.sim ?? 0);
+    const rerankOn = r.rerankEnabled !== false && r.rerankModel !== "rerank-off";
     return `
-      <h3>检索效果预估</h3>
-      <ul class="engine-stats">
-        <li><span>Top-K</span><b>${d.retrieve.topK}</b></li>
-        <li><span>相似度</span><b>${Number(d.retrieve.sim).toFixed(2)}</b></li>
-        <li><span>向量 / 关键词</span><b>${d.retrieve.vectorWeight}% / ${kw}%</b></li>
-      </ul>
-      <div class="engine-impact"><h4>变更影响预估</h4><p>模型 ${esc(d.retrieve.model)}，${d.retrieve.mode === "realtime" ? "实时" : "批量"}抽取。提高阈值会减少召回条数、提高精度。</p></div>`;
+      <div class="fg-preview">
+        <header class="fg-preview-hd">
+          <div>
+            <h3>检索效果预估</h3>
+            <p>基于当前召回与重排配置</p>
+          </div>
+        </header>
+        <ul class="engine-stats">
+          <li><span>召回 Top-K</span><b>${r.topK ?? "—"}</b></li>
+          <li><span>相似度阈值</span><b>${sim.toFixed(2)}</b></li>
+          <li><span>向量 / 关键词</span><b>${vecOn || kwOn ? `${vw}% / ${kw}%` : "未启用"}</b></li>
+          <li><span>重排</span><b>${rerankOn ? esc(r.rerankModel || "已启用") : "关闭"}</b></li>
+        </ul>
+        <div class="fg-metric-grid">
+          <div class="fg-metric"><span>向量召回</span><b>${vecOn ? r.vectorTopK ?? "—" : "关"}</b></div>
+          <div class="fg-metric"><span>关键词召回</span><b>${kwOn ? r.keywordTopK ?? "—" : "关"}</b></div>
+          <div class="fg-metric"><span>最终返回</span><b>${r.topK ?? "—"}</b></div>
+        </div>
+        <div class="engine-impact">
+          <h4>变更影响预估</h4>
+          <p>提高相似度阈值会减少召回条数、提高精度；提高 Top-K 会增加上下文占用。</p>
+        </div>
+      </div>`;
   }
 
   /* ---------- boot ---------- */
@@ -12324,10 +13640,6 @@
       state.sidebarExpanded = !state.sidebarExpanded;
       renderChrome();
     });
-    $("#topbar-sidebar-toggle")?.addEventListener("click", () => {
-      state.sidebarExpanded = !state.sidebarExpanded;
-      renderChrome();
-    });
     $("#topbar-bell")?.addEventListener("click", () => toast("暂无新通知"));
 
     $("#topbar-view-switch").addEventListener("click", (e) => {
@@ -12335,7 +13647,7 @@
       if (!btn || state.user.role === "user") return;
       const target = btn.dataset.targetView || (state.viewMode === "admin" ? "user" : "admin");
       state.viewMode = target;
-      state.page = state.viewMode === "user" ? "memories" : "monitor";
+      state.page = "memories";
       renderChrome();
       renderPage();
     });
