@@ -6348,7 +6348,7 @@
           : renderReflectEngine(d.reflect);
       paneEl.innerHTML =
         tab === "forget"
-          ? `<div class="engine-split">
+          ? `<div class="engine-split is-forget">
             <section class="engine-form">${pane}</section>
             <aside class="engine-preview">${renderEnginePreview(tab, d, space)}</aside>
           </div>`
@@ -6365,9 +6365,19 @@
       } else {
         paneEl.onchange = null;
         paneEl.oninput = null;
+        const refreshForgetPreview =
+          tab === "forget" ? bindForgetLivePreview(body, d, space) : null;
         paneEl.querySelectorAll("[data-eng]").forEach((el) => {
-          const key = el.dataset.eng;
           const apply = () => {
+            if (tab === "forget") {
+              applyForgetEngInput(el, d, body, () => {
+                refreshForgetPreview?.();
+                space.config.forget = { ...d.forget };
+                markCustom();
+              });
+              return;
+            }
+            const key = el.dataset.eng;
             const cur = d[tab];
             if (el.type === "checkbox") cur[key] = el.checked;
             else if (el.type === "range" || el.type === "number") cur[key] = Number(el.value);
@@ -6376,7 +6386,6 @@
             if (el.type === "checkbox" && em) em.textContent = el.checked ? "已启用" : "已关闭";
             const lab = body.querySelector(`[data-eng-val="${key}"]`);
             if (lab) lab.textContent = formatEngVal(key, cur[key]);
-            // 变更即时写入工作副本，最终由底部「保存/取消」决定是否落库
             space.config[tab] = { ...cur };
             markCustom();
             const preview = body.querySelector(".engine-preview");
@@ -12856,27 +12865,24 @@
   }
 
   function defaultForgetDraft(space) {
-    const presets = {
-      "sp-concert": { lambdaTime: 0.08, lambdaMem: 0.05, threshold: 0.35, intervalHours: 6 },
-      "sp-travel": { lambdaTime: 0.12, lambdaMem: 0.06, threshold: 0.4, intervalHours: 12 },
-      "sp-hr": { lambdaTime: 0.05, lambdaMem: 0.04, threshold: 0.28, intervalHours: 24 },
-    };
     const saved = space?.config?.forget || {};
-    return {
-      enabled: true,
-      lambdaTime: 0.08,
-      lambdaMem: 0.05,
-      offset: 0.15,
-      decayCoef: 1.5,
-      maxHistory: 50,
-      threshold: 0.35,
-      minUnvisitedDays: 7,
-      useLlm: true,
-      maxMergeNodes: 8,
-      intervalHours: 6,
-      ...(presets[space?.id] || {}),
-      ...saved,
+    const num = (v, fallback) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fallback;
     };
+    return {
+      enabled: saved.enabled !== false,
+      tauBase: num(saved.tauBase, 30),
+      rho: num(saved.rho, 0.5),
+      S: num(saved.S ?? saved.stability, 0.5),
+      threshold: num(saved.threshold ?? saved.thetaDown, 0.25),
+      rBase: 1,
+    };
+  }
+
+  function normalizeForgetDraft(draft) {
+    if (!draft) return;
+    draft.forget = defaultForgetDraft({ config: { forget: draft.forget || {} } });
   }
 
   function defaultReflectDraft(space) {
@@ -12923,6 +12929,7 @@
     }
     const draft = state.engineDraftBySpace[spaceId];
     normalizeReflectDraft(draft);
+    normalizeForgetDraft(draft);
     return draft;
   }
 
@@ -13076,7 +13083,7 @@
         </div>
         ${
           tab === "forget"
-            ? `<div class="engine-split">
+            ? `<div class="engine-split is-forget">
                 <section class="engine-form ${paneLocked ? "is-locked" : ""}">${opsLocked ? `<p class="badge badge-warn">当前账号仅可查看，无空间运维权限</p>` : ""}${pane}</section>
                 <aside class="engine-preview">${renderEnginePreview(tab, d, space)}</aside>
               </div>`
@@ -13117,9 +13124,15 @@
     if (isProdForm) {
       bindConfigForms(root, space, paneLocked);
     } else {
+      const refreshForgetPreview =
+        tab === "forget" ? bindForgetLivePreview(root, d, space) : null;
       root.querySelectorAll("[data-eng]").forEach((el) => {
         const key = el.dataset.eng;
         const apply = () => {
+          if (tab === "forget") {
+            applyForgetEngInput(el, d, root, refreshForgetPreview);
+            return;
+          }
           const cur = d[tab];
           if (el.type === "checkbox") cur[key] = el.checked;
           else if (el.type === "range" || el.type === "number") cur[key] = Number(el.value);
@@ -13217,67 +13230,188 @@
     });
   }
 
+  function bindForgetLivePreview(root, d, space) {
+    const preview = root?.querySelector?.(".engine-preview") || root;
+    if (!preview) return;
+
+    const refresh = () => {
+      preview.innerHTML = renderForgetPreview(d.forget || defaultForgetDraft(space));
+      bindForgetChartHover(preview, d.forget || defaultForgetDraft(space));
+      preview.querySelectorAll("[data-forget-scene]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.forgetSceneNHit = Number(btn.dataset.forgetScene) || 0;
+          refresh();
+        });
+      });
+    };
+
+    // initial hover + scene
+    bindForgetChartHover(preview, d.forget || defaultForgetDraft(space));
+    preview.querySelectorAll("[data-forget-scene]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.forgetSceneNHit = Number(btn.dataset.forgetScene) || 0;
+        refresh();
+      });
+    });
+
+    return refresh;
+  }
+
+  function bindForgetChartHover(preview, f) {
+    const card = preview.querySelector(".fg-chart-card");
+    const svg = preview.querySelector("[data-forget-chart]");
+    const tip = preview.querySelector("[data-forget-tip]");
+    const cross = preview.querySelector(".fgc-cross-x");
+    const dot = preview.querySelector(".fgc-hover-dot");
+    const host = preview.querySelector("[data-forget-preview]");
+    if (!card || !svg || !tip || !host) return;
+    const g = forgetChartGeom();
+    const maxDay = Number(host.dataset.maxDay) || 90;
+    const nHit = Number(host.dataset.nHit) || 0;
+    const plotL = g.padL;
+    const plotR = g.w - g.padR;
+    const plotB = g.h - g.padB;
+    const plotT = g.padT;
+    const sleepDay = forgetSleepDay(f, nHit);
+
+    const hide = () => {
+      tip.classList.add("hidden");
+      if (cross) cross.setAttribute("visibility", "hidden");
+      if (dot) dot.setAttribute("visibility", "hidden");
+    };
+
+    svg.addEventListener("mouseleave", hide);
+    svg.addEventListener("mousemove", (e) => {
+      const rect = svg.getBoundingClientRect();
+      const xSvg = ((e.clientX - rect.left) / rect.width) * g.w;
+      if (xSvg < plotL || xSvg > plotR) {
+        hide();
+        return;
+      }
+      const day = ((xSvg - plotL) / (plotR - plotL)) * maxDay;
+      const r = forgetR(f, day, nHit);
+      const pt = forgetXy(day, r, g, maxDay);
+      if (cross) {
+        cross.setAttribute("x1", pt.x.toFixed(1));
+        cross.setAttribute("x2", pt.x.toFixed(1));
+        cross.setAttribute("visibility", "visible");
+      }
+      if (dot) {
+        dot.setAttribute("cx", pt.x.toFixed(1));
+        dot.setAttribute("cy", pt.y.toFixed(1));
+        dot.setAttribute("visibility", "visible");
+      }
+      const nearSleep = Math.abs(day - sleepDay) < maxDay * 0.02;
+      tip.classList.remove("hidden");
+      tip.style.left = `${(pt.x / g.w) * 100}%`;
+      tip.style.top = `${(pt.y / g.h) * 100}%`;
+      tip.innerHTML = nearSleep
+        ? `<b>第 ${day.toFixed(1)} 天</b><span>R = ${r.toFixed(3)}</span><em>≈ 达到 threshold（休眠点）</em>`
+        : `<b>第 ${day.toFixed(1)} 天</b><span>R = ${r.toFixed(3)}</span>`;
+    });
+  }
+
+  function applyForgetEngInput(el, d, root, refreshPreview) {
+    const key = el.dataset.eng;
+    const cur = d.forget;
+    if (!cur || !key) return;
+    if (el.type === "checkbox") {
+      cur[key] = el.checked;
+      const em = el.closest(".ui-toggle")?.querySelector("em");
+      if (em) em.textContent = el.checked ? "已启用" : "已关闭";
+    } else if (el.type === "range" || el.type === "number") {
+      let v = Number(el.value);
+      const min = el.min !== "" ? Number(el.min) : null;
+      const max = el.max !== "" ? Number(el.max) : null;
+      if (Number.isFinite(min)) v = Math.max(min, v);
+      if (Number.isFinite(max)) v = Math.min(max, v);
+      if (!Number.isFinite(v)) return;
+      cur[key] = v;
+      root.querySelectorAll(`[data-eng="${key}"]`).forEach((twin) => {
+        if (twin !== el) twin.value = String(v);
+      });
+    } else {
+      cur[key] = el.value;
+    }
+    refreshPreview?.();
+  }
+
   function formatEngVal(key, val) {
-    if (["sim", "threshold", "lambdaTime", "lambdaMem", "offset"].includes(key)) return Number(val).toFixed(2);
-    if (key === "decayCoef") return Number(val).toFixed(1);
+    if (["rho", "S", "threshold", "sim"].includes(key)) {
+      return Number(val).toFixed(2);
+    }
+    if (key === "tauBase") return `${Number(val).toFixed(0)} 天`;
     if (key === "vectorWeight") return `向量 ${val}%`;
     return String(val);
   }
 
-  function forgetWeight(f, day, profile) {
-    const offset = Math.min(0.9, Math.max(0, Number(f.offset) || 0));
-    const span = 1 - offset;
-    let lambda;
-    if (profile === "fast") lambda = 0.25;
-    else if (profile === "slow") lambda = 0.02;
-    else {
-      const coef = Number(f.decayCoef) || 1.5;
-      lambda =
-        (Number(f.lambdaTime) || 0.08) * (coef / 1.5) + (Number(f.lambdaMem) || 0.05) * 0.6;
-    }
-    return Math.max(0, Math.min(1.08, offset + span * Math.exp(-lambda * day)));
+  /** τ_eff = τ_base × (0.5 + S) × (1 + ρ × ln(1 + n_hit)) */
+  function forgetTauEff(f, nHit = 0) {
+    const tauBase = Math.max(0.1, Number(f.tauBase) || 30);
+    const S = Math.max(0, Number(f.S) ?? 0.5);
+    const rho = Math.max(0, Number(f.rho) || 0);
+    const n = Math.max(0, Number(nHit) || 0);
+    return tauBase * (0.5 + S) * (1 + rho * Math.log(1 + n));
   }
 
-  function forgetCrossDay(f) {
-    const limit = Number(f.threshold) || 0.35;
-    for (let d = 1; d <= 60; d++) {
-      if (forgetWeight(f, d) < limit) return d;
-    }
-    return null;
+  /** R(t) = r_base × exp(-(t - t_last) / τ_eff)，曲线以 t_last = 0 */
+  function forgetR(f, day, nHit = 0) {
+    const rBase = Math.max(0.01, Number(f.rBase) || 1);
+    const tau = forgetTauEff(f, nHit);
+    return rBase * Math.exp(-Math.max(0, day) / tau);
+  }
+
+  function forgetHalfLifeDays(f, nHit = 0) {
+    return forgetTauEff(f, nHit) * Math.LN2;
+  }
+
+  function forgetSleepDay(f, nHit = 0) {
+    const rBase = Math.max(0.01, Number(f.rBase) || 1);
+    const theta = Math.max(0.001, Number(f.threshold) || 0.25);
+    if (rBase <= theta) return 0;
+    const tau = forgetTauEff(f, nHit);
+    return tau * Math.log(rBase / theta);
   }
 
   function forgetChartGeom() {
-    return { padL: 40, padR: 16, padT: 22, padB: 36, w: 360, h: 220, maxDay: 30, maxW: 1.15 };
+    return { padL: 44, padR: 18, padT: 18, padB: 40, w: 520, h: 280, maxR: 1.05, maxDay: 180 };
   }
 
-  function forgetXy(day, weight, g = forgetChartGeom()) {
+  function forgetXy(day, r, g, maxDay) {
     const plotW = g.w - g.padL - g.padR;
     const plotH = g.h - g.padT - g.padB;
-    const x = g.padL + (day / g.maxDay) * plotW;
-    const y = g.padT + (1 - Math.min(g.maxW, Math.max(0, weight)) / g.maxW) * plotH;
+    const x = g.padL + (day / maxDay) * plotW;
+    const y = g.padT + (1 - Math.min(g.maxR, Math.max(0, r)) / g.maxR) * plotH;
     return { x, y };
   }
 
-  function forgetCurvePath(fn, g = forgetChartGeom()) {
+  function forgetCurvePath(fn, g, maxDay) {
     const pts = [];
-    for (let d = 0; d <= g.maxDay; d += 0.5) {
-      const { x, y } = forgetXy(d, fn(d), g);
+    const step = Math.max(0.25, maxDay / 160);
+    for (let d = 0; d <= maxDay + 1e-6; d += step) {
+      const { x, y } = forgetXy(d, fn(d), g, maxDay);
       pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
     }
     return pts.join(" ");
   }
 
-  function forgetAreaPath(fn, g = forgetChartGeom()) {
+  function forgetAreaPath(fn, g, maxDay) {
     const base = g.h - g.padB;
-    const start = forgetXy(0, fn(0), g);
+    const start = forgetXy(0, fn(0), g, maxDay);
     let d = `M ${start.x.toFixed(1)} ${base.toFixed(1)} L ${start.x.toFixed(1)} ${start.y.toFixed(1)}`;
-    for (let day = 0.5; day <= g.maxDay; day += 0.5) {
-      const p = forgetXy(day, fn(day), g);
+    const step = Math.max(0.25, maxDay / 160);
+    for (let day = step; day <= maxDay + 1e-6; day += step) {
+      const p = forgetXy(day, fn(day), g, maxDay);
       d += ` L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
     }
-    const end = forgetXy(g.maxDay, fn(g.maxDay), g);
+    const end = forgetXy(maxDay, fn(maxDay), g, maxDay);
     d += ` L ${end.x.toFixed(1)} ${base.toFixed(1)} Z`;
     return d;
+  }
+
+  function forgetSceneNHit() {
+    const n = Number(state.forgetSceneNHit);
+    return Number.isFinite(n) && n >= 0 ? n : 3;
   }
 
   function renderRetrieveEngine(c) {
@@ -13314,25 +13448,26 @@
   }
 
   function renderForgetEngine(c) {
-    const dis = "";
-    const slider = (key, val, min, max, step) => `
-      <div class="fg-slider">
-        <b data-eng-val="${key}">${formatEngVal(key, val)}</b>
-        <input type="range" data-eng="${key}" min="${min}" max="${max}" step="${step}" value="${val}" ${dis} />
-      </div>`;
-    const num = (key, val, min, max, step) =>
-      `<input class="input fg-num" type="number" data-eng="${key}" min="${min}" max="${max}" step="${step}" value="${val}" ${dis} />`;
-    const row = (title, hint, ctrl) => `
-      <div class="fg-row">
-        <div class="fg-meta"><strong>${title}</strong><span>${hint}</span></div>
-        <div class="fg-ctrl">${ctrl}</div>
-      </div>`;
     const on = c.enabled !== false;
+    const param = (key, symbol, unit, title, hint, val, min, max, step) => `
+      <div class="fg-param">
+        <div class="fg-param-hd">
+          <div class="fg-param-title">
+            <strong>${symbol}</strong>
+            <span>${title}${unit ? `（${unit}）` : ""}</span>
+          </div>
+          <p>${hint}</p>
+        </div>
+        <div class="fg-param-ctrl">
+          <input type="range" data-eng="${key}" min="${min}" max="${max}" step="${step}" value="${val}" />
+          <input class="input fg-param-num" type="number" data-eng="${key}" min="${min}" max="${max}" step="${step}" value="${val}" />
+        </div>
+      </div>`;
     return `
       <header class="engine-hd">
         <div>
           <h3>遗忘引擎</h3>
-          <p>模拟人类遗忘规律，通过衰减权重和阈值清理低权重、过期记忆。</p>
+          <p>τ_eff = τ_base × (0.5 + S) × (1 + ρ × ln(1 + n_hit)) · R(t) = r_base × exp(-(t − t_last)/τ_eff)</p>
         </div>
         <label class="ui-toggle engine-hd-switch">
           <input type="checkbox" data-eng="enabled" ${on ? "checked" : ""} />
@@ -13340,29 +13475,124 @@
           <em>${on ? "已启用" : "已关闭"}</em>
         </label>
       </header>
-      <div class="forget-form">
-        ${row("时间衰减率 λ_time", "控制随时间自然衰减的速度，数值越大衰减越快", slider("lambdaTime", c.lambdaTime, 0.01, 0.4, 0.01))}
-        ${row("记忆提取率 λ_mem", "访问越频繁，记忆强度越高，衰减越慢", slider("lambdaMem", c.lambdaMem, 0.01, 0.3, 0.01))}
-        ${row("偏移量 Offset", "保留下限，避免重要记忆被完全清零", slider("offset", c.offset, 0, 0.5, 0.01))}
-        ${row("衰减常数", "决定曲线形态，越大前期下降越陡", num("decayCoef", c.decayCoef, 0.2, 5, 0.1))}
-        ${row("访问历史最大长度", "计算行为强度时保留的历史访问条数", num("maxHistory", c.maxHistory, 5, 200, 1))}
-        ${row("遗忘阈值", "权重低于该值的记忆进入清理或降级", slider("threshold", c.threshold, 0.05, 0.9, 0.01))}
-        ${row("最小未访问天数", "未访问达到该天数后才开始按曲线衰减", num("minUnvisitedDays", c.minUnvisitedDays, 0, 90, 1))}
-        ${row(
-          "使用 LLM 生成摘要",
-          "压缩长对话并抽取核心意图，便于长期管理",
-          `<label class="fg-switch"><input type="checkbox" data-eng="useLlm" ${c.useLlm ? "checked" : ""} /><em>${c.useLlm ? "已启用" : "已关闭"}</em></label>`
-        )}
-        ${row("单次最大融合节点数", "限制单次融合规模，避免语义丢失和上下文溢出", num("maxMergeNodes", c.maxMergeNodes, 1, 32, 1))}
-        ${row(
-          "遗忘周期间隔",
-          "周期任务的执行频率，用于控制计算开销",
-          `<select class="select fg-select" data-eng="intervalHours">
-            ${[1, 6, 12, 24]
-              .map((h) => `<option value="${h}" ${Number(c.intervalHours) === h ? "selected" : ""}>${h} 小时</option>`)
-              .join("")}
-          </select>`
-        )}
+      <div class="forget-form forget-form-core">
+        <div class="fg-section-hd">
+          <strong>核心衰减参数</strong>
+          <span>曲线按上式实时计算，r_base=1，t_last=0</span>
+        </div>
+        ${param("tauBase", "τ_base", "天", "基础衰减时间", "基准寿命尺度，默认 30 天", c.tauBase, 1, 180, 1)}
+        ${param("rho", "ρ", "", "命中历史增益", "仅当 n_hit>0 时生效：乘在 (1 + ρ·ln(1+n_hit)) 上；n_hit=0 时该项恒为 1", c.rho, 0, 2, 0.01)}
+        ${param("S", "S", "", "稳定因子", "参与 (0.5 + S) 项，控制整体衰减快慢，默认 0.50", c.S, 0, 1, 0.01)}
+        ${param("threshold", "threshold", "", "休眠阈值", "R 低于该值时进入休眠，默认 0.25", c.threshold, 0.05, 0.9, 0.01)}
+      </div>`;
+  }
+
+  function renderForgetPreview(f) {
+    const nHit = forgetSceneNHit();
+    const scenes = [
+      { n: 0, label: "n_hit=0" },
+      { n: 1, label: "n_hit=1" },
+      { n: 3, label: "n_hit=3" },
+      { n: 5, label: "n_hit=5" },
+      { n: 10, label: "n_hit=10" },
+    ];
+    const halfLife = forgetHalfLifeDays(f, nHit);
+    const sleepDay = forgetSleepDay(f, nHit);
+    const theta = Number(f.threshold) || 0.25;
+    const rho = Math.max(0, Number(f.rho) || 0);
+    const hitGain = 1 + rho * Math.log(1 + nHit);
+    const g = forgetChartGeom();
+    // 固定横轴，避免随参数伸缩导致曲线形态看起来不变
+    const maxDay = g.maxDay;
+    const rFn = (day) => forgetR(f, day, nHit);
+    const baseFn = (day) => forgetR(f, day, 0);
+    const nowPath = forgetCurvePath(rFn, g, maxDay);
+    const nowArea = forgetAreaPath(rFn, g, maxDay);
+    const basePath = nHit > 0 ? forgetCurvePath(baseFn, g, maxDay) : "";
+    const plotL = g.padL;
+    const plotR = g.w - g.padR;
+    const plotB = g.h - g.padB;
+    const plotT = g.padT;
+    const threshY = forgetXy(0, theta, g, maxDay).y;
+    const sleepOnChart = sleepDay <= maxDay + 1e-6;
+    const sleepX = forgetXy(Math.min(sleepDay, maxDay), theta, g, maxDay).x;
+    const yTicks = [0, 0.25, 0.5, 0.75, 1];
+    const xTicks = [0, 30, 60, 90, 120, 150, 180];
+    const gridY = yTicks
+      .map((t) => {
+        const y = forgetXy(0, t, g, maxDay).y;
+        return `<line class="fgc-grid" x1="${plotL}" y1="${y.toFixed(1)}" x2="${plotR}" y2="${y.toFixed(1)}" />
+          <text class="fgc-tick" x="${plotL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${t.toFixed(2)}</text>`;
+      })
+      .join("");
+    const gridX = xTicks
+      .map((t) => {
+        const x = forgetXy(t, 0, g, maxDay).x;
+        return `<line class="fgc-grid-v" x1="${x.toFixed(1)}" y1="${plotT}" x2="${x.toFixed(1)}" y2="${plotB}" />
+          <text class="fgc-tick" x="${x.toFixed(1)}" y="${plotB + 16}" text-anchor="middle">${t}</text>`;
+      })
+      .join("");
+    const fmtDays = (d) => (d >= 100 ? d.toFixed(0) : d.toFixed(1));
+    return `
+      <div class="fg-preview fg-preview-live" data-forget-preview data-max-day="${maxDay}" data-n-hit="${nHit}">
+        <header class="fg-preview-hd">
+          <div>
+            <h3>遗忘衰减曲线</h3>
+            <p>横轴：距上次有效接触的天数 · 纵轴：记忆强度 R · ρ 通过 n_hit 放大 τ_eff</p>
+          </div>
+        </header>
+        <div class="fg-scene-bar" role="tablist" aria-label="曲线场景">
+          <span>曲线场景</span>
+          ${scenes
+            .map(
+              (s) =>
+                `<button type="button" class="fg-scene-btn ${nHit === s.n ? "active" : ""}" data-forget-scene="${s.n}" role="tab" aria-selected="${nHit === s.n}">${s.label}</button>`
+            )
+            .join("")}
+        </div>
+        <div class="fg-chart-card">
+          <svg class="fg-chart" viewBox="0 0 ${g.w} ${g.h}" role="img" aria-label="遗忘衰减曲线" data-forget-chart>
+            <defs>
+              <linearGradient id="fg-area" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#0067de" stop-opacity="0.26"/>
+                <stop offset="100%" stop-color="#0067de" stop-opacity="0.02"/>
+              </linearGradient>
+            </defs>
+            <rect class="fgc-plot" x="${plotL}" y="${plotT}" width="${plotR - plotL}" height="${plotB - plotT}" rx="8"/>
+            ${gridY}
+            ${gridX}
+            <line class="fgc-thresh" x1="${plotL}" y1="${threshY.toFixed(1)}" x2="${plotR}" y2="${threshY.toFixed(1)}" stroke-dasharray="5 4" />
+            <text class="fgc-thresh-label" x="${plotR - 4}" y="${Math.max(plotT + 12, threshY - 6).toFixed(1)}" text-anchor="end">threshold=${theta.toFixed(2)} 休眠阈值</text>
+            ${basePath ? `<polyline class="fgc-line fgc-base" points="${basePath}" fill="none" />` : ""}
+            <path class="fgc-area" d="${nowArea}" />
+            <polyline class="fgc-line fgc-now" points="${nowPath}" fill="none" />
+            ${
+              sleepOnChart
+                ? `<line class="fgc-sleep-mark" x1="${sleepX.toFixed(1)}" y1="${plotT}" x2="${sleepX.toFixed(1)}" y2="${plotB}" stroke-dasharray="3 3" />
+                   <circle class="fgc-dot fgc-sleep-dot" cx="${sleepX.toFixed(1)}" cy="${threshY.toFixed(1)}" r="4" />
+                   <text class="fgc-sleep-label" x="${sleepX.toFixed(1)}" y="${(plotT + 12).toFixed(1)}" text-anchor="middle">休眠 · 第 ${fmtDays(sleepDay)} 天</text>`
+                : `<text class="fgc-sleep-label" x="${plotR - 4}" y="${(plotT + 12).toFixed(1)}" text-anchor="end">休眠点超出横轴（第 ${fmtDays(sleepDay)} 天）</text>`
+            }
+            <line class="fgc-crosshair fgc-cross-x" x1="${plotL}" y1="${plotT}" x2="${plotL}" y2="${plotB}" visibility="hidden" />
+            <circle class="fgc-hover-dot" cx="0" cy="0" r="4" visibility="hidden" />
+          </svg>
+          <div class="fg-hover-tip hidden" data-forget-tip></div>
+          <div class="fg-legend">
+            ${nHit > 0 ? `<span><i class="lg-base"></i>n_hit=0 基线（ρ 无效）</span>` : ""}
+            <span><i class="lg-now"></i>当前场景 n_hit=${nHit}</span>
+          </div>
+          <div class="fg-axis-note">距上次有效接触（天）</div>
+        </div>
+        <div class="fg-result">
+          <div class="fg-section-hd">
+            <strong>计算结果</strong>
+            <span>1 + ρ·ln(1+n_hit) = ${hitGain.toFixed(3)}${nHit === 0 ? "（n_hit=0，ρ 不参与）" : ""}</span>
+          </div>
+          <div class="fg-metric-grid fg-result-grid">
+            <div class="fg-metric"><span>真实半衰期</span><b>${fmtDays(halfLife)} 天</b></div>
+            <div class="fg-metric"><span>预计进入休眠</span><b>第 ${fmtDays(sleepDay)} 天</b></div>
+          </div>
+        </div>
       </div>`;
   }
 
@@ -13455,98 +13685,7 @@
 
   function renderEnginePreview(tab, d, space, formRoot) {
     if (tab === "forget") {
-      const f = d.forget;
-      const g = forgetChartGeom();
-      const w = (day, profile) => forgetWeight(f, day, profile);
-      const thresh = Number(f.threshold) || 0.35;
-      const day7 = w(7);
-      const day30 = w(30);
-      const cross = forgetCrossDay(f);
-      const p7 = forgetXy(7, day7, g);
-      const p30 = forgetXy(30, day30, g);
-      const plotL = g.padL;
-      const plotR = g.w - g.padR;
-      const plotB = g.h - g.padB;
-      const plotT = g.padT;
-      const threshY = forgetXy(0, thresh, g).y;
-      const threshTagY = Math.max(plotT + 2, Math.min(plotB - 20, threshY - 14));
-      const yTicks = [0, 0.5, 1.0, 1.15];
-      const xTicks = [0, 7, 14, 21, 30];
-      const fastPath = forgetCurvePath((day) =>
-        forgetWeight({ ...f, lambdaTime: 0.25, lambdaMem: 0, decayCoef: 1.5, offset: f.offset }, day, "fast")
-      );
-      const slowPath = forgetCurvePath((day) => forgetWeight(f, day, "slow"));
-      const nowPath = forgetCurvePath((day) => w(day));
-      const nowArea = forgetAreaPath((day) => w(day));
-      const gridY = yTicks
-        .map((t) => {
-          const y = forgetXy(0, t, g).y;
-          return `<line class="fgc-grid" x1="${plotL}" y1="${y.toFixed(1)}" x2="${plotR}" y2="${y.toFixed(1)}" />
-            <text class="fgc-tick" x="${plotL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${t.toFixed(2)}</text>`;
-        })
-        .join("");
-      const gridX = xTicks
-        .map((t) => {
-          const x = forgetXy(t, 0, g).x;
-          return `<line class="fgc-grid-v" x1="${x.toFixed(1)}" y1="${plotT}" x2="${x.toFixed(1)}" y2="${plotB}" />
-            <text class="fgc-tick" x="${x.toFixed(1)}" y="${plotB + 16}" text-anchor="middle">${t === 0 ? "0" : `${t}天`}</text>`;
-        })
-        .join("");
-      return `
-        <div class="fg-preview">
-          <header class="fg-preview-hd">
-            <div>
-              <h3>遗忘衰减曲线</h3>
-              <p>权重随未访问天数变化 · λ_time ${Number(f.lambdaTime).toFixed(2)}</p>
-            </div>
-          </header>
-          <div class="fg-chart-card">
-            <svg class="fg-chart" viewBox="0 0 ${g.w} ${g.h}" role="img" aria-label="遗忘衰减曲线">
-              <defs>
-                <linearGradient id="fg-area" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#0067de" stop-opacity="0.28"/>
-                  <stop offset="100%" stop-color="#0067de" stop-opacity="0.02"/>
-                </linearGradient>
-                <linearGradient id="fg-zone" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#ff7d00" stop-opacity="0"/>
-                  <stop offset="100%" stop-color="#ff7d00" stop-opacity="0.08"/>
-                </linearGradient>
-              </defs>
-              <rect class="fgc-plot" x="${plotL}" y="${plotT}" width="${plotR - plotL}" height="${plotB - plotT}" rx="8"/>
-              ${gridY}
-              ${gridX}
-              <rect x="${plotL}" y="${threshY}" width="${plotR - plotL}" height="${Math.max(0, plotB - threshY)}" fill="url(#fg-zone)"/>
-              <line class="fgc-thresh" x1="${plotL}" y1="${threshY.toFixed(1)}" x2="${plotR}" y2="${threshY.toFixed(1)}" />
-              <rect class="fgc-thresh-tag" x="${plotL + 8}" y="${threshTagY.toFixed(1)}" width="72" height="16" rx="4"/>
-              <text class="fgc-thresh-label" x="${plotL + 44}" y="${(threshTagY + 11).toFixed(1)}" text-anchor="middle">阈值 ${thresh.toFixed(2)}</text>
-              <polyline class="fgc-line fgc-fast" points="${fastPath}" />
-              <polyline class="fgc-line fgc-slow" points="${slowPath}" />
-              <path class="fgc-area" d="${nowArea}" />
-              <polyline class="fgc-line fgc-now" points="${nowPath}" />
-              <circle class="fgc-dot" cx="${p7.x.toFixed(1)}" cy="${p7.y.toFixed(1)}" r="3.5"/>
-              <circle class="fgc-dot" cx="${p30.x.toFixed(1)}" cy="${p30.y.toFixed(1)}" r="3.5"/>
-            </svg>
-            <div class="fg-legend">
-              <span><i class="lg-fast"></i>快速衰减 λ0.25</span>
-              <span><i class="lg-now"></i>当前配置</span>
-              <span><i class="lg-slow"></i>慢速衰减 λ0.02</span>
-            </div>
-          </div>
-          <div class="fg-metric-grid">
-            <div class="fg-metric">
-              <span>7 天未访问</span>
-              <b>${day7.toFixed(2)}</b>
-            </div>
-            <div class="fg-metric">
-              <span>30 天未访问</span>
-              <b>${day30.toFixed(2)}</b>
-            </div>
-            <div class="fg-metric">
-              <span>跌破阈值</span>
-              <b>${cross ? `第 ${cross} 天` : "未跌破"}</b>
-            </div>
-          </div>
-        </div>`;
+      return renderForgetPreview(d.forget || defaultForgetDraft());
     }
     if (tab === "reflect") {
       return "";
